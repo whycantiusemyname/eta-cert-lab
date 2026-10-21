@@ -121,6 +121,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                     @Override
                                     protected void afterHookedMethod(MethodHookParam param) {
                                         signLeafOnce(lpparam);
+                                        startMitm(lpparam);
                                     }
                                 });
                     } catch (Throwable t) {
@@ -134,6 +135,47 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+
+    // ------------------------------------------------------------------ mitm
+
+    private static boolean mitmStarted;
+
+    private static void startMitm(XC_LoadPackage.LoadPackageParam lpparam) {
+        if (mitmStarted) return;
+        mitmStarted = true;
+        try {
+            Context ctx = appContext();
+            if (ctx == null) {
+                XposedBridge.log(TAG + ": no context, mitm not started");
+                return;
+            }
+            MitmServer.start(ctx, s -> XposedBridge.log(TAG + ": " + s));
+            hookSocketRedirect(lpparam);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": mitm start failed: " + t);
+        }
+    }
+
+    private static void hookSocketRedirect(XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            XposedBridge.hookAllMethods(java.net.Socket.class, "connect", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (MitmServer.BYPASS.get()) return;
+                    int port = MitmServer.port();
+                    if (port <= 0) return;
+                    Object a = param.args[0];
+                    if (!(a instanceof java.net.InetSocketAddress)) return;
+                    java.net.InetSocketAddress addr = (java.net.InetSocketAddress) a;
+                    if (addr.getPort() != 443) return;
+                    param.args[0] = new java.net.InetSocketAddress("127.0.0.1", port);
+                }
+            });
+            XposedBridge.log(TAG + ": socket redirect installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": socket redirect failed: " + t);
+        }
+    }
 
     // ------------------------------------------------------------- signing
 
