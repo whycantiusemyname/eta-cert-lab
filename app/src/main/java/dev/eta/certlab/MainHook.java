@@ -91,6 +91,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean bypassBlocklist = true;
     /** sign a leaf certificate on device with the leaked intermediate */
     private static boolean signLeaf = true;
+    /** rewrite integrity verdicts in HTTP responses (no proxy needed) */
+    private static boolean rewriteResponse = true;
     /** hostname to sign for; overridden by files/eta-cert-lab/target.txt */
     private static String targetHost = "integrity.1nikolas.dev";
     /** which intermediate to use for signing */
@@ -108,6 +110,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
         try {
             if (bypassBlocklist) hookBlocklist(lpparam);
+            if (rewriteResponse) hookResponse(lpparam);
             if (injectCa) hookSslContext(lpparam);
             if (signLeaf) {
                 // Context is usually not ready this early: retry once the app is bound.
@@ -134,7 +137,119 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+
+    // ------------------------------------------------------- response rewrite
+
+    private static final String FAKE_VERDICTS =
+            "\"deviceIntegrity\":{\"deviceRecognitionVerdict\":["
+            + "\"MEETS_BASIC_INTEGRITY\",\"MEETS_DEVICE_INTEGRITY\",\"MEETS_STRONG_INTEGRITY\"]}";
+
+    private static boolean looksLikeVerdict(String s) {
+        return s != null && (s.contains("deviceRecognitionVerdict") || s.contains("deviceIntegrity"));
+    }
+
+    /** Replace the verdict fields inside a JSON body, keeping the rest of the document. */
+    private static String rewriteJson(String body) {
+        try {
+            org.json.JSONObject o = new org.json.JSONObject(body);
+            // unwrap the Google envelope if present
+            org.json.JSONObject target = o.has("tokenPayloadExternal")
+                    ? o.getJSONObject("tokenPayloadExternal") : o;
+            org.json.JSONObject dev = target.optJSONObject("deviceIntegrity");
+            if (dev == null) dev = new org.json.JSONObject();
+            org.json.JSONArray arr = new org.json.JSONArray();
+            arr.put("MEETS_BASIC_INTEGRITY");
+            arr.put("MEETS_DEVICE_INTEGRITY");
+            arr.put("MEETS_STRONG_INTEGRITY");
+            dev.put("deviceRecognitionVerdict", arr);
+            target.put("deviceIntegrity", dev);
+            return o.toString();
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": rewrite failed: " + t);
+            return body;
+        }
+    }
+
+    private void hookResponse(XC_LoadPackage.LoadPackageParam lpparam) {
+        // OkHttp
+        try {
+            Class<?> rb = XposedHelpers.findClass("okhttp3.ResponseBody", lpparam.classLoader);
+            XposedBridge.hookAllMethods(rb, "string", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object r = param.getResult();
+                    if (r instanceof String && looksLikeVerdict((String) r)) {
+                        XposedBridge.log(TAG + ": rewriting okhttp body");
+                        param.setResult(rewriteJson((String) r));
+                    }
+                }
+            });
+            XposedBridge.hookAllMethods(rb, "bytes", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object r = param.getResult();
+                    if (r instanceof byte[]) {
+                        String s = new String((byte[]) r);
+                        if (looksLikeVerdict(s)) {
+                            XposedBridge.log(TAG + ": rewriting okhttp bytes");
+                            param.setResult(rewriteJson(s).getBytes());
+                        }
+                    }
+                }
+            });
+            XposedBridge.log(TAG + ": okhttp response hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": no okhttp (" + t + ")");
+        }
+
+        // HttpURLConnection: wrap the stream
+        try {
+            Class<?> uc = XposedHelpers.findClass("java.net.URLConnection", lpparam.classLoader);
+            XposedBridge.hookAllMethods(uc, "getInputStream", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Object r = param.getResult();
+                    if (!(r instanceof java.io.InputStream)) return;
+                    String url = "";
+                    try {
+                        url = ((java.net.URLConnection) param.thisObject).getURL().toString().toLowerCase();
+                    } catch (Throwable ignored) {
+                    }
+                    // only touch endpoints that can carry an integrity verdict
+                    if (!(url.contains("integrity") || url.contains("/api/check") || url.contains("token="))) {
+                        return;
+                    }
+                    param.setResult(new RewritingStream((java.io.InputStream) r));
+                }
+            });
+            XposedBridge.log(TAG + ": URLConnection response hook installed");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": no URLConnection hook (" + t + ")");
+        }
+    }
+
+    /** Buffers a response body and rewrites it if it carries integrity verdicts. */
+    private static class RewritingStream extends java.io.InputStream {
+        private final java.io.ByteArrayInputStream in;
+
+        RewritingStream(java.io.InputStream src) throws java.io.IOException {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = src.read(buf)) > 0) bos.write(buf, 0, n);
+            src.close();
+            String s = new String(bos.toByteArray());
+            byte[] out = looksLikeVerdict(s) ? rewriteJson(s).getBytes() : bos.toByteArray();
+            this.in = new java.io.ByteArrayInputStream(out);
+        }
+
+        @Override public int read() { return in.read(); }
+        @Override public int read(byte[] b, int off, int len) { return in.read(b, off, len); }
+        @Override public int available() { return in.available(); }
+    }
+
     // ------------------------------------------------------------- signing
+
 
     /** Derive the P-384 private key for a tiny integer d. */
     private static PrivateKey deriveKey(int d) throws Exception {
