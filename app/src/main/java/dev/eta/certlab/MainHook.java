@@ -6,16 +6,14 @@ import android.content.res.AssetManager;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.StringWriter;
 import java.math.BigInteger;
 import java.security.AlgorithmParameters;
 import java.security.KeyFactory;
-import java.security.KeyStore;
 import java.security.PrivateKey;
-import java.security.PublicKey;
-import java.security.Security;
 import java.security.cert.CertPath;
 import java.security.cert.CertPathValidator;
 import java.security.cert.CertificateFactory;
@@ -35,14 +33,17 @@ import java.util.Set;
 import java.util.TreeMap;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.BasicConstraints;
+import org.bouncycastle.asn1.x509.ExtendedKeyUsage;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.GeneralNames;
+import org.bouncycastle.asn1.x509.KeyPurposeId;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
@@ -60,9 +61,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Eta Cert Lab (LSPosed)
  *
  * Scope: only apps selected in LSPosed manager.
- *  - per-app CA injection (own demo CA or a derived eMudhra intermediate)
- *  - optional bypass of Conscrypt's public-key blocklist
- *  - optional on-device leaf signing with the leaked eMudhra intermediates
+ *  - per-app CA injection (own demo CA), used as a fallback trust anchor
+ *  - bypass of Conscrypt's public-key blocklist
+ *  - in-process MITM that signs leaves with a leaked eMudhra intermediate
  *
  * For security research on your own device only.
  */
@@ -70,13 +71,17 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "EtaCertLab";
     private static final String CA_ASSET = "ca.pem";
-    private static final String EMU_DIR = "emudhra";
+    static final String EMU_DIR = "emudhra";
+    /** which leaked intermediate signs the MITM leaves */
+    static final String SIGNER_NAME = "EM-OV-TLS-CA-G3C";
+    /** the cross-signed root that chains the intermediate to a trust anchor */
+    static final String CROSS_NAME = "emSign-Root-TLS-CA-G3";
 
     /**
      * Leaked eMudhra intermediates: name -> private key d (a tiny integer).
      * The public keys in the certificates match d * G on P-384.
      */
-    private static final Map<String, Integer> EMUDHRA_KEYS = new TreeMap<String, Integer>() {{
+    static final Map<String, Integer> EMUDHRA_KEYS = new TreeMap<String, Integer>() {{
         put("EM-DV-TLS-CA-G3B", 156);
         put("EM-DV-TLS-CA-G3C", 230);
         put("EM-EV-TLS-CA-G3B", 115);
@@ -87,19 +92,23 @@ public class MainHook implements IXposedHookLoadPackage {
         put("EM-OV-TLS-CA-G3C", 4);
     }};
 
+    /** Registers nothing globally; passed explicitly to every JCA helper. */
+    static final BouncyCastleProvider BC = new BouncyCastleProvider();
+    private static final java.security.SecureRandom RNG = new java.security.SecureRandom();
+
     private static boolean injectCa = true;
     private static boolean bypassBlocklist = true;
-    /** sign a leaf certificate on device with the leaked intermediate */
+    /** write a demo leaf for the configured host into the app's private dir */
     private static boolean signLeaf = true;
     /** hostname to sign for; overridden by files/eta-cert-lab/target.txt */
     private static String targetHost = "integrity.1nikolas.dev";
-    /** which intermediate to use for signing */
-    private static String signerName = "EM-OV-TLS-CA-G3C";
 
     private static X509Certificate caCert;
-    private static boolean caLoaded;
+    private static volatile boolean caLoaded;
+
+    private static int signAttempts;
     private static boolean signDone;
-    private static volatile boolean signOk;
+    private static boolean bindHooked;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -109,32 +118,49 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             if (bypassBlocklist) hookBlocklist(lpparam);
             if (injectCa) hookSslContext(lpparam);
-            if (signLeaf) {
-                // Context is usually not ready this early: retry once the app is bound.
-                signLeafOnce(lpparam);
-                if (!signOk) {
-                    try {
-                        XposedHelpers.findAndHookMethod("android.app.ActivityThread",
-                                lpparam.classLoader, "handleBindApplication",
-                                "android.app.ActivityThread$AppBindData",
-                                new XC_MethodHook() {
-                                    @Override
-                                    protected void afterHookedMethod(MethodHookParam param) {
-                                        signLeafOnce(lpparam);
-                                        startMitm(lpparam);
-                                    }
-                                });
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + ": bind hook failed: " + t);
-                    }
-                }
-            }
+            // Context is almost never ready this early, so the bind hook is what really
+            // does the work: it runs once the Application object exists.
+            hookBind(lpparam);
+            hookHostCapture();
+            signLeafOnce();
             XposedBridge.log(TAG + ": loaded in " + lpparam.packageName);
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": hook failed in " + lpparam.packageName + ": " + t);
         }
     }
 
+    // ------------------------------------------------------------------ bind
+
+    /**
+     * Runs after ActivityThread.handleBindApplication, i.e. when currentApplication()
+     * is finally non-null. Everything that needs a Context happens here.
+     */
+    private static void hookBind(XC_LoadPackage.LoadPackageParam lpparam) {
+        if (bindHooked) return;
+        bindHooked = true;
+        try {
+            XposedHelpers.findAndHookMethod("android.app.ActivityThread",
+                    lpparam.classLoader, "handleBindApplication",
+                    "android.app.ActivityThread$AppBindData",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                signLeafOnce();
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + ": sign in bind failed: " + t);
+                            }
+                            try {
+                                startMitm(lpparam);
+                            } catch (Throwable t) {
+                                XposedBridge.log(TAG + ": mitm in bind failed: " + t);
+                            }
+                        }
+                    });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": bind hook failed: " + t);
+        }
+    }
 
     // ------------------------------------------------------------------ mitm
 
@@ -150,25 +176,34 @@ public class MainHook implements IXposedHookLoadPackage {
                 return;
             }
             MitmServer.start(ctx, s -> XposedBridge.log(TAG + ": " + s));
-            hookSocketRedirect(lpparam);
+            hookSocketRedirect();
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": mitm start failed: " + t);
         }
     }
 
-    private static void hookSocketRedirect(XC_LoadPackage.LoadPackageParam lpparam) {
+    private static boolean redirectHooked;
+
+    private static void hookSocketRedirect() {
+        if (redirectHooked) return;
+        redirectHooked = true;
         try {
             XposedBridge.hookAllMethods(java.net.Socket.class, "connect", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (MitmServer.BYPASS.get()) return;
-                    int port = MitmServer.port();
-                    if (port <= 0) return;
+                    int lp = MitmServer.port();
+                    if (lp <= 0) return;
+                    if (param.args == null || param.args.length == 0) return;
                     Object a = param.args[0];
                     if (!(a instanceof java.net.InetSocketAddress)) return;
                     java.net.InetSocketAddress addr = (java.net.InetSocketAddress) a;
                     if (addr.getPort() != 443) return;
-                    param.args[0] = new java.net.InetSocketAddress("127.0.0.1", port);
+                    // never redirect our own connections or connections that already point here
+                    String h = addr.getAddress() == null ? null : addr.getAddress().getHostAddress();
+                    if (h != null && (h.equals("127.0.0.1") || h.equals("::1"))) return;
+                    MitmServer.noteHost(addr.getHostString());
+                    param.args[0] = new java.net.InetSocketAddress("127.0.0.1", lp);
                 }
             });
             XposedBridge.log(TAG + ": socket redirect installed");
@@ -177,11 +212,41 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Socket.connect() only sees the resolved address (often a Clash fake-IP), so the
+     * SNI fallback needs a better source: the hostname handed to SSLSocketFactory.
+     */
+    private static boolean hostCaptureHooked;
+
+    private static void hookHostCapture() {
+        if (hostCaptureHooked) return;
+        hostCaptureHooked = true;
+        try {
+            XposedBridge.hookAllMethods(SSLSocketFactory.class, "createSocket", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    for (Object a : param.args) {
+                        if (a instanceof String && looksLikeHost((String) a)) {
+                            MitmServer.noteHost((String) a);
+                        }
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": host capture failed: " + t);
+        }
+    }
+
+    private static boolean looksLikeHost(String s) {
+        if (s == null || s.length() < 4 || s.length() > 255) return false;
+        if (s.indexOf(' ') >= 0 || s.indexOf('/') >= 0) return false;
+        return s.indexOf('.') > 0;
+    }
+
     // ------------------------------------------------------------- signing
 
-
     /** Derive the P-384 private key for a tiny integer d. */
-    private static PrivateKey deriveKey(int d) throws Exception {
+    static PrivateKey deriveKey(int d) throws Exception {
         AlgorithmParameters params = AlgorithmParameters.getInstance("EC");
         params.init(new ECGenParameterSpec("secp384r1"));
         ECParameterSpec spec = params.getParameterSpec(ECParameterSpec.class);
@@ -190,7 +255,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     /** Load an intermediate certificate from assets/emudhra/<name>.crt.pem */
-    private static X509Certificate loadIntermediate(AssetManager am, String name) throws Exception {
+    static X509Certificate loadIntermediate(AssetManager am, String name) throws Exception {
         InputStream in = am.open(EMU_DIR + "/" + name + ".crt.pem");
         try {
             return (X509Certificate) CertificateFactory.getInstance("X.509")
@@ -200,28 +265,51 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static String toPem(Object o) throws Exception {
+    static X509Certificate buildLeaf(String host, java.security.PublicKey subjectKey,
+                                     String issuerDn, PrivateKey signer) throws Exception {
+        long now = System.currentTimeMillis();
+        JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
+                new X500Name(issuerDn),
+                new BigInteger(64, RNG),
+                new Date(now - 3600_000L),
+                new Date(now + 30L * 24 * 3600 * 1000),
+                new X500Name("CN=" + host),
+                subjectKey);
+        builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(false));
+        builder.addExtension(Extension.subjectAlternativeName, false,
+                new GeneralNames(new GeneralName[]{new GeneralName(GeneralName.dNSName, host)}));
+        builder.addExtension(Extension.keyUsage, true,
+                new org.bouncycastle.asn1.x509.KeyUsage(
+                        org.bouncycastle.asn1.x509.KeyUsage.digitalSignature
+                                | org.bouncycastle.asn1.x509.KeyUsage.keyEncipherment));
+        // The eMudhra intermediates carry an EKU extension, so RFC 5280 requires the leaf
+        // to repeat serverAuth or path validation fails.
+        builder.addExtension(Extension.extendedKeyUsage, false,
+                new ExtendedKeyUsage(KeyPurposeId.id_kp_serverAuth));
+        X509CertificateHolder holder = builder.build(
+                new JcaContentSignerBuilder("SHA384withECDSA").setProvider(BC).build(signer));
+        return new JcaX509CertificateConverter().setProvider(BC).getCertificate(holder);
+    }
+
+    static byte[] toPem(Object o) throws Exception {
         StringWriter sw = new StringWriter();
         JcaPEMWriter pw = new JcaPEMWriter(sw);
         pw.writeObject(o);
         pw.close();
-        return sw.toString();
+        return sw.toString().getBytes("UTF-8");
     }
 
-    private void signLeafOnce(XC_LoadPackage.LoadPackageParam lpparam) {
-        synchronized (MainHook.class) {
-            if (signDone) return;
-            signDone = true;
+    private static synchronized void signLeafOnce() {
+        if (signDone) return;
+        Context ctx = appContext();
+        if (ctx == null) {
+            if (signAttempts < 5) {
+                signAttempts++;
+                XposedBridge.log(TAG + ": no app context yet, signing deferred");
+            }
+            return;
         }
         try {
-            if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
-                Security.addProvider(new BouncyCastleProvider());
-            }
-            Context ctx = appContext();
-            if (ctx == null) {
-                XposedBridge.log(TAG + ": no app context, skip signing");
-                return;
-            }
             File dir = new File(ctx.getFilesDir(), "eta-cert-lab");
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
@@ -229,41 +317,29 @@ public class MainHook implements IXposedHookLoadPackage {
             String host = targetHost;
             File hostFile = new File(dir, "target.txt");
             if (hostFile.exists()) {
-                String s = new String(readAll(new java.io.FileInputStream(hostFile)), "UTF-8").trim();
+                String s = new String(readAll(new FileInputStream(hostFile)), "UTF-8").trim();
                 if (s.length() > 0) host = s;
             }
 
-            X509Certificate intermediate = loadIntermediate(ctx.getAssets(), signerName);
-            PrivateKey caKey = deriveKey(EMUDHRA_KEYS.get(signerName));
+            X509Certificate intermediate = loadIntermediate(ctx.getAssets(), SIGNER_NAME);
+            Integer d = EMUDHRA_KEYS.get(SIGNER_NAME);
+            if (d == null) throw new IllegalStateException("no leaked key for " + SIGNER_NAME);
+            PrivateKey caKey = deriveKey(d);
 
             java.security.KeyPairGenerator kpg = java.security.KeyPairGenerator.getInstance("EC");
             kpg.initialize(new ECGenParameterSpec("secp384r1"));
             java.security.KeyPair leafKp = kpg.generateKeyPair();
 
-            long now = System.currentTimeMillis();
-            X500Name issuer = new X500Name(intermediate.getSubjectX500Principal().getName());
-            X500Name subject = new X500Name("CN=" + host);
-            JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
-                    issuer,
-                    BigInteger.valueOf(now),
-                    new Date(now - 3600_000L),
-                    new Date(now + 30L * 24 * 3600 * 1000),
-                    subject,
-                    leafKp.getPublic());
-            builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(false));
-            builder.addExtension(Extension.subjectAlternativeName, false,
-                    new GeneralNames(new GeneralName[]{new GeneralName(GeneralName.dNSName, host)}));
+            X509Certificate leaf = buildLeaf(host, leafKp.getPublic(),
+                    intermediate.getSubjectX500Principal().getName(), caKey);
 
-            X509CertificateHolder holder = builder.build(
-                    new JcaContentSignerBuilder("SHA384withECDSA").build(caKey));
-            X509Certificate leaf = new JcaX509CertificateConverter().getCertificate(holder);
+            writeFile(new File(dir, "leaf.pem"), toPem(leaf));
+            writeFile(new File(dir, "leaf.key"), toPem(leafKp.getPrivate()));
+            writeFile(new File(dir, "intermediate.pem"), toPem(intermediate));
 
-            writeFile(new File(dir, "leaf.pem"), toPem(leaf).getBytes("UTF-8"));
-            writeFile(new File(dir, "leaf.key"), toPem(leafKp.getPrivate()).getBytes("UTF-8"));
-            writeFile(new File(dir, "intermediate.pem"), toPem(intermediate).getBytes("UTF-8"));
-
-            signOk = true;
-            XposedBridge.log(TAG + ": signed leaf for " + host + " with " + signerName + " -> " + dir.getAbsolutePath());
+            signDone = true;
+            XposedBridge.log(TAG + ": signed leaf for " + host + " with " + SIGNER_NAME
+                    + " -> " + dir.getAbsolutePath());
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": signing failed: " + t);
         }
@@ -283,18 +359,33 @@ public class MainHook implements IXposedHookLoadPackage {
     // ---------------------------------------------------------------- blocklist
 
     private void hookBlocklist(XC_LoadPackage.LoadPackageParam lpparam) {
+        Class<?> cls = null;
+        String name = "com.android.org.conscrypt.CertBlocklistImpl";
+        ClassLoader[] loaders = new ClassLoader[]{
+                lpparam.classLoader, MainHook.class.getClassLoader(), null};
+        for (ClassLoader cl : loaders) {
+            try {
+                cls = cl == null ? Class.forName(name) : XposedHelpers.findClass(name, cl);
+                if (cls != null) break;
+            } catch (Throwable ignored) {
+            }
+        }
+        if (cls == null) {
+            XposedBridge.log(TAG + ": CertBlocklistImpl not found");
+            return;
+        }
         try {
-            Class<?> cls = XposedHelpers.findClass("com.android.org.conscrypt.CertBlocklistImpl", lpparam.classLoader);
-            XposedBridge.hookAllMethods(cls, "isPublicKeyBlockListed", new XC_MethodHook() {
+            final Class<?> target = cls;
+            XposedBridge.hookAllMethods(target, "isPublicKeyBlockListed", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    param.setResult(false);
+                    param.setResult(Boolean.FALSE);
                 }
             });
-            XposedBridge.hookAllMethods(cls, "isSerialNumberBlockListed", new XC_MethodHook() {
+            XposedBridge.hookAllMethods(target, "isSerialNumberBlockListed", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    param.setResult(false);
+                    param.setResult(Boolean.FALSE);
                 }
             });
         } catch (Throwable t) {
@@ -307,13 +398,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private void hookSslContext(XC_LoadPackage.LoadPackageParam lpparam) {
         XposedBridge.hookAllMethods(SSLContext.class, "init", new XC_MethodHook() {
             @Override
-            protected void afterHookedMethod(MethodHookParam param) {
+            protected void beforeHookedMethod(MethodHookParam param) {
+                // Must be "before": init() copies the trust managers into the SSLContextSpi,
+                // so mutating the array afterwards has no effect.
                 try {
                     Object[] args = param.args;
                     if (args == null) return;
                     for (int i = 0; i < args.length; i++) {
                         if (args[i] instanceof TrustManager[]) {
-                            args[i] = wrap((TrustManager[]) args[i], lpparam);
+                            args[i] = wrap((TrustManager[]) args[i]);
                         }
                     }
                 } catch (Throwable t) {
@@ -323,7 +416,7 @@ public class MainHook implements IXposedHookLoadPackage {
         });
     }
 
-    private TrustManager[] wrap(TrustManager[] original, XC_LoadPackage.LoadPackageParam lpparam) {
+    private TrustManager[] wrap(TrustManager[] original) {
         if (original == null) return null;
         List<TrustManager> out = new ArrayList<>();
         for (TrustManager tm : original) {
@@ -389,7 +482,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ------------------------------------------------------------------- CA
 
-    private static Context appContext() {
+    static Context appContext() {
         try {
             Object app = XposedHelpers.callStaticMethod(Class.forName("android.app.ActivityThread"), "currentApplication");
             return (Context) app;
@@ -400,7 +493,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static synchronized X509Certificate loadCa() {
         if (caLoaded) return caCert;
-        caLoaded = true;
         try {
             Context ctx = appContext();
             if (ctx == null) return null;
@@ -408,7 +500,7 @@ public class MainHook implements IXposedHookLoadPackage {
             File f = new File(ctx.getFilesDir(), "eta-cert-lab/ca.pem");
             InputStream in;
             if (f.exists()) {
-                in = new java.io.FileInputStream(f);
+                in = new FileInputStream(f);
             } else {
                 in = ctx.getAssets().open(CA_ASSET);
             }
@@ -419,14 +511,16 @@ public class MainHook implements IXposedHookLoadPackage {
             } finally {
                 in.close();
             }
+            caLoaded = true;
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": no usable CA (" + t + ")");
+            XposedBridge.log(TAG + ": no usable demo CA (" + t + ")");
             caCert = null;
+            caLoaded = false; // retry on the next handshake
         }
         return caCert;
     }
 
-    private static byte[] readAll(InputStream in) throws Exception {
+    static byte[] readAll(InputStream in) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         byte[] buf = new byte[4096];
         int n;
