@@ -7,40 +7,43 @@
 | **注入 CA** | 在目标 app 的 `SSLContext` 里叠加一个信任锚（系统 CA + 你的 CA），不修改任何系统文件 |
 | **绕过公钥黑名单** | 让 `CertBlocklistImpl.isPublicKeyBlockListed()` 在目标 app 内恒返回 false，用于观察"纯信任链"行为 |
 
-## 为什么按作用域更好
+## 快速开始
 
-- **不污染全局**：只有勾选的 app 受影响，其它 app 的 TLS 保持原样；
-- **时机正确**：LSPosed 在 app 代码执行**之前**注入，不存在"信任库已缓存"的时机问题；
-- **随时可关**：在 LSPosed 里取消勾选即可，无需卸载或重启系统。
-
-## 使用
-
-1. **准备 CA**（只用公钥部分，绝不提交私钥）：
-   ```sh
-   cp my-test-ca.pem app/src/main/assets/ca.pem
+1. 安装 APK（Actions 产物或自行构建）；
+2. 打开 LSPosed → 模块 → 启用 **Eta Cert Lab**；
+3. 在"作用域"里勾选目标 app；
+4. **强制停止目标 app 再重新打开**（LSPosed 只在 app 新进程启动时注入，这步不做会以为"没生效"）；
+5. LSPosed 日志里应出现：
    ```
-   如果只想用黑名单绕过，保留占位文件即可。
-
-2. **构建 APK**：
-   - GitHub Actions：推送到 `main` 后，在 Actions 页面下载 `eta-cert-lab-apk` 产物；
-   - 或本地：`./gradlew assembleDebug`。
-
-3. **安装并启用**：
-   - 安装 APK；
-   - 打开 LSPosed → 模块 → 启用 **Eta Cert Lab**；
-   - 在"作用域"里勾选目标 app（默认给了两个 checker 的包名）；
-   - 强制停止目标 app 后重新打开。
-
-4. **验证**：
-   ```sh
-   # LSPosed 日志里应出现
    EtaCertLab: loaded in <package>
    ```
+
+## 关于 CA
+
+`app/src/main/assets/ca.pem` 里预置了一张**示例 CA**（`Eta Cert Lab Demo CA`），对应私钥在 `samples/demo-ca.key`。
+
+- 只想用"绕过黑名单"：不用管 CA，模块加载失败也只记一条日志，不影响黑名单 hook；
+- 想验证"注入 CA"：把 `assets/ca.pem` 换成**你自己的 CA 公钥**再重新构建，或直接用 `samples/demo-ca.key` 在本地签证书。
+
+> ⚠️ **示例私钥是公开的**：任何拿到它的人都能给装了该 CA 的设备做中间人。它只用于本地实验，绝不要在你重视的设备上长期启用，测完就取消勾选。
+
+## 本地用示例 CA 起测试服务
+
+```sh
+# 用示例 CA 签一张测试证书
+openssl req -new -key leaf.key -out leaf.csr -subj "/CN=example.test"
+openssl x509 -req -in leaf.csr -CA samples/demo-ca.pem -CAkey samples/demo-ca.key \
+  -CAcreateserial -days 30 -sha256 -out leaf.pem
+
+# 起服务（或直接用 mitmproxy 导入 demo-ca.key）
+openssl s_server -accept 443 -cert leaf.pem -key leaf.key -www
+```
 
 ## 实现要点
 
 - hook `javax.net.ssl.SSLContext.init`：把传入的 `X509TrustManager` 包一层，先走原生校验，失败时再用注入的 CA 做 PKIX 校验；
-- hook `com.android.org.conscrypt.CertBlocklistImpl#isPublicKeyBlockListed` / `#isSerialNumberBlockListed`：直接返回 false。
+- hook `com.android.org.conscrypt.CertBlocklistImpl#isPublicKeyBlockListed` / `#isSerialNumberBlockListed`：直接返回 false；
+- 兼容 LSPosed 的经典 Xposed API（`de.robv.android.xposed:api:82`）；如需迁移到 `io.github.libxposed:api` 可自行替换。
 
 ## 注意
 
