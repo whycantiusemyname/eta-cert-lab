@@ -222,25 +222,28 @@ public class MainHook implements IXposedHookLoadPackage {
         if (hostCaptureHooked) return;
         hostCaptureHooked = true;
         try {
-            XposedBridge.hookAllMethods(SSLSocketFactory.class, "createSocket", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    for (Object a : param.args) {
-                        if (a instanceof String && looksLikeHost((String) a)) {
-                            MitmServer.noteHost((String) a);
+            // hookAllMethods would trip over the abstract createSocket() overload and
+            // could leave the interesting one unhooked, so target it explicitly.
+            XposedHelpers.findAndHookMethod(SSLSocketFactory.class, "createSocket",
+                    java.net.Socket.class, String.class, int.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            Object a = param.args[1];
+                            if (a instanceof String) MitmServer.noteHost((String) a);
                         }
-                    }
-                }
-            });
+                    });
+            XposedHelpers.findAndHookMethod(SSLSocketFactory.class, "createSocket",
+                    String.class, int.class, new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            Object a = param.args[0];
+                            if (a instanceof String) MitmServer.noteHost((String) a);
+                        }
+                    });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": host capture failed: " + t);
         }
-    }
-
-    private static boolean looksLikeHost(String s) {
-        if (s == null || s.length() < 4 || s.length() > 255) return false;
-        if (s.indexOf(' ') >= 0 || s.indexOf('/') >= 0) return false;
-        return s.indexOf('.') > 0;
     }
 
     // ------------------------------------------------------------- signing
@@ -266,10 +269,10 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     static X509Certificate buildLeaf(String host, java.security.PublicKey subjectKey,
-                                     String issuerDn, PrivateKey signer) throws Exception {
+                                     byte[] issuerDn, PrivateKey signer) throws Exception {
         long now = System.currentTimeMillis();
         JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
-                new X500Name(issuerDn),
+                X500Name.getInstance(issuerDn),
                 new BigInteger(64, RNG),
                 new Date(now - 3600_000L),
                 new Date(now + 30L * 24 * 3600 * 1000),
@@ -317,7 +320,11 @@ public class MainHook implements IXposedHookLoadPackage {
             String host = targetHost;
             File hostFile = new File(dir, "target.txt");
             if (hostFile.exists()) {
-                String s = new String(readAll(new FileInputStream(hostFile)), "UTF-8").trim();
+                byte[] raw;
+                try (FileInputStream fin = new FileInputStream(hostFile)) {
+                    raw = readAll(fin);
+                }
+                String s = new String(raw, "UTF-8").trim();
                 if (s.length() > 0) host = s;
             }
 
@@ -331,7 +338,7 @@ public class MainHook implements IXposedHookLoadPackage {
             java.security.KeyPair leafKp = kpg.generateKeyPair();
 
             X509Certificate leaf = buildLeaf(host, leafKp.getPublic(),
-                    intermediate.getSubjectX500Principal().getName(), caKey);
+                    intermediate.getSubjectX500Principal().getEncoded(), caKey);
 
             writeFile(new File(dir, "leaf.pem"), toPem(leaf));
             writeFile(new File(dir, "leaf.key"), toPem(leafKp.getPrivate()));

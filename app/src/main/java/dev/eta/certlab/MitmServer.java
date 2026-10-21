@@ -120,7 +120,7 @@ final class MitmServer {
         // Prove the derived key really belongs to the certificate before serving anything.
         KeyPair probeKp = newKeyPair();
         X509Certificate probe = MainHook.buildLeaf("probe.invalid", probeKp.getPublic(),
-                signerCert.getSubjectX500Principal().getName(), signerKey);
+                signerCert.getSubjectX500Principal().getEncoded(), signerKey);
         probe.verify(signerCert.getPublicKey());
         log("signer verified: " + signerCert.getSubjectX500Principal().getName()
                 + " / cross: " + crossCert.getIssuerX500Principal().getName());
@@ -143,7 +143,7 @@ final class MitmServer {
 
         KeyPair kp = newKeyPair();
         X509Certificate leaf = MainHook.buildLeaf(host, kp.getPublic(),
-                signerCert.getSubjectX500Principal().getName(), signerKey);
+                signerCert.getSubjectX500Principal().getEncoded(), signerKey);
 
         Object[] out = new Object[]{kp.getPrivate(),
                 new X509Certificate[]{leaf, signerCert, crossCert}};
@@ -296,7 +296,9 @@ final class MitmServer {
     private static String firstLine(byte[] req) {
         int end = 0;
         while (end < req.length && req[end] != '\r' && req[end] != '\n') end++;
-        return new String(req, 0, end);
+        String s = new String(req, 0, end);
+        // never dump a full JWE to the log
+        return s.length() > 120 ? s.substring(0, 120) + "..." : s;
     }
 
     /** Reads the request line + headers, plus the body when Content-Length is present. */
@@ -353,7 +355,7 @@ final class MitmServer {
         String s = new String(req, java.nio.charset.StandardCharsets.ISO_8859_1);
         int end = s.indexOf("\r\n\r\n");
         String head = end >= 0 ? s.substring(0, end) : s;
-        String body = end >= 0 ? s.substring(end) : "";
+        String body = end >= 0 ? s.substring(end + 4) : "";
         StringBuilder sb = new StringBuilder();
         boolean replaced = false;
         for (String line : head.split("\r\n")) {
@@ -376,13 +378,15 @@ final class MitmServer {
     /** Connect to the real server (bypassing the redirect hook) and relay one request. */
     private static byte[] forward(String host, byte[] req) {
         BYPASS.set(Boolean.TRUE);
+        Socket raw = null;
+        SSLSocket tls = null;
         try {
-            Socket raw = new Socket();
+            raw = new Socket();
             raw.connect(new InetSocketAddress(host, 443), 10000);
             raw.setSoTimeout(15000);
             SSLContext ctx = SSLContext.getInstance("TLS");
             ctx.init(null, null, null);
-            SSLSocket tls = (SSLSocket) ctx.getSocketFactory()
+            tls = (SSLSocket) ctx.getSocketFactory()
                     .createSocket(raw, host, 443, true);
             tls.setSoTimeout(15000);
             tls.startHandshake();
@@ -399,12 +403,22 @@ final class MitmServer {
                 // keep-alive server that ignored Connection: close; we already have the body
                 if (bos.size() == 0) throw te;
             }
-            tls.close();
             return bos.toByteArray();
         } catch (Throwable e) {
             log("forward failed " + host + ": " + e);
             return null;
         } finally {
+            if (tls != null) {
+                try {
+                    tls.close();
+                } catch (Throwable ignored) {
+                }
+            } else if (raw != null) {
+                try {
+                    raw.close();
+                } catch (Throwable ignored) {
+                }
+            }
             BYPASS.set(Boolean.FALSE);
         }
     }
