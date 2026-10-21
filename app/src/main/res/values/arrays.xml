@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Default scope shown in LSPosed; user can change it per-app in the manager. -->
+    <string-array name="xposed_scope">
+        <item>gr.nikolasspyr.integritycheck</item>
+        <item>com.henrikherzig.playintegritychecker</item>
+    </string-array>
+</resources>
