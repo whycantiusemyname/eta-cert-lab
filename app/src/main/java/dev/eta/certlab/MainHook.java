@@ -178,7 +178,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // ------------------------------------------------------------------- CA
 
-    private synchronized X509Certificate loadCa() {
+    private static synchronized X509Certificate loadCa() {
         if (caLoaded) return caCert;
         caLoaded = true;
         try {
