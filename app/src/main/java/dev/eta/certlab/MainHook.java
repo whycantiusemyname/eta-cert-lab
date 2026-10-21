@@ -99,6 +99,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private static X509Certificate caCert;
     private static boolean caLoaded;
     private static boolean signDone;
+    private static volatile boolean signOk;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -108,7 +109,25 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             if (bypassBlocklist) hookBlocklist(lpparam);
             if (injectCa) hookSslContext(lpparam);
-            if (signLeaf) signLeafOnce(lpparam);
+            if (signLeaf) {
+                // Context is usually not ready this early: retry once the app is bound.
+                signLeafOnce(lpparam);
+                if (!signOk) {
+                    try {
+                        XposedHelpers.findAndHookMethod("android.app.ActivityThread",
+                                lpparam.classLoader, "handleBindApplication",
+                                "android.app.ActivityThread$AppBindData",
+                                new XC_MethodHook() {
+                                    @Override
+                                    protected void afterHookedMethod(MethodHookParam param) {
+                                        signLeafOnce(lpparam);
+                                    }
+                                });
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + ": bind hook failed: " + t);
+                    }
+                }
+            }
             XposedBridge.log(TAG + ": loaded in " + lpparam.packageName);
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": hook failed in " + lpparam.packageName + ": " + t);
@@ -199,6 +218,7 @@ public class MainHook implements IXposedHookLoadPackage {
             writeFile(new File(dir, "leaf.key"), toPem(leafKp.getPrivate()).getBytes("UTF-8"));
             writeFile(new File(dir, "intermediate.pem"), toPem(intermediate).getBytes("UTF-8"));
 
+            signOk = true;
             XposedBridge.log(TAG + ": signed leaf for " + host + " with " + signerName + " -> " + dir.getAbsolutePath());
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": signing failed: " + t);
