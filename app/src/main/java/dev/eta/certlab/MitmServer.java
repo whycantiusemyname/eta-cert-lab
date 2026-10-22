@@ -58,6 +58,8 @@ final class MitmServer {
 
     private static volatile int port = -1;
     private static volatile String lastHost;
+    /** hostname reported by the SNI matcher for the connection being handshaken */
+    private static final ThreadLocal<String> SNI_CAPTURED = new ThreadLocal<>();
     private static X509Certificate signerCert;
     private static X509Certificate crossCert;
     private static PrivateKey signerKey;
@@ -224,19 +226,21 @@ final class MitmServer {
         }
 
         private String alias(Socket socket, SSLEngine engine) {
-            String host = null;
+            String host = SNI_CAPTURED.get();
             try {
                 SSLSession hs = null;
-                if (socket instanceof SSLSocket) {
-                    hs = ((SSLSocket) socket).getHandshakeSession();
-                } else if (engine != null) {
-                    hs = engine.getHandshakeSession();
-                }
-                if (hs instanceof ExtendedSSLSession) {
-                    for (SNIServerName n : ((ExtendedSSLSession) hs).getRequestedServerNames()) {
-                        if (n.getType() == 0) {
-                            host = ((SNIHostName) n).getAsciiName();
-                            break;
+                if (host == null) {
+                    if (socket instanceof SSLSocket) {
+                        hs = ((SSLSocket) socket).getHandshakeSession();
+                    } else if (engine != null) {
+                        hs = engine.getHandshakeSession();
+                    }
+                    if (hs instanceof ExtendedSSLSession) {
+                        for (SNIServerName n : ((ExtendedSSLSession) hs).getRequestedServerNames()) {
+                            if (n.getType() == 0) {
+                                host = ((SNIHostName) n).getAsciiName();
+                                break;
+                            }
                         }
                     }
                 }
@@ -305,20 +309,40 @@ final class MitmServer {
                     .createSocket(c, "localhost", 443, true);
             tls.setUseClientMode(false);
             tls.setSoTimeout(15000);
+            // Conscrypt may hand out a null handshake session this early, so ask the SNI
+            // matcher to capture the name as well; whichever arrives first wins.
+            try {
+                javax.net.ssl.SSLParameters sp = tls.getSSLParameters();
+                sp.setSNIMatchers(java.util.Collections.singletonList(
+                        new javax.net.ssl.SNIMatcher(0) {
+                            @Override
+                            public boolean matches(SNIServerName n) {
+                                if (n instanceof SNIHostName) {
+                                    SNI_CAPTURED.set(((SNIHostName) n).getAsciiName());
+                                }
+                                return true;
+                            }
+                        }));
+                tls.setSSLParameters(sp);
+            } catch (Throwable t) {
+                log("sni matcher unavailable: " + t);
+            }
             tls.startHandshake();
 
-            String sni = null;
-            try {
-                SSLSession s = tls.getSession();
-                if (s instanceof ExtendedSSLSession) {
-                    for (SNIServerName n : ((ExtendedSSLSession) s).getRequestedServerNames()) {
-                        if (n.getType() == 0) {
-                            sni = ((SNIHostName) n).getAsciiName();
-                            break;
+            String sni = SNI_CAPTURED.get();
+            if (sni == null) {
+                try {
+                    SSLSession s = tls.getSession();
+                    if (s instanceof ExtendedSSLSession) {
+                        for (SNIServerName n : ((ExtendedSSLSession) s).getRequestedServerNames()) {
+                            if (n.getType() == 0) {
+                                sni = ((SNIHostName) n).getAsciiName();
+                                break;
+                            }
                         }
                     }
+                } catch (Throwable ignored) {
                 }
-            } catch (Throwable ignored) {
             }
             if (sni == null || sni.isEmpty() || isIpLiteral(sni) || sni.equalsIgnoreCase("localhost")) {
                 sni = lastHost;
