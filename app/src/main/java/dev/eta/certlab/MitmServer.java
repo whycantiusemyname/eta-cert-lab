@@ -245,21 +245,22 @@ final class MitmServer {
                 return;
             }
             String host = normalizeHost(sni[0]);
-            if (host == null) host = normalizeHost(lastHost);
-
-            if (!ALL_TRAFFIC && (host == null || !shouldInterceptHost(host))) {
-                if (host == null) {
-                    log("DROP: ClientHello carried no SNI and no hostname is known");
+            if (host == null) {
+                // No SNI: only proceed when we already know the connection belongs to a
+                // target host, otherwise routing it somewhere would be a guess.
+                String guess = normalizeHost(lastHost);
+                if (guess != null && shouldInterceptHost(guess)) {
+                    log("MITM  " + guess + " (no SNI, using captured host)");
+                    mitm(c, hello, guess);
+                } else {
+                    log("DROP: no SNI and no known target host");
                     c.close();
-                    return;
                 }
-                log("RELAY " + host + " (" + hello.length + "B peeked)");
-                relayToReal(c, hello, host);
                 return;
             }
-            if (host == null) {
-                log("DROP: interception is on but the host is unknown");
-                c.close();
+            if (!ALL_TRAFFIC && !shouldInterceptHost(host)) {
+                log("RELAY " + host + " (" + hello.length + "B peeked)");
+                relayToReal(c, hello, host);
                 return;
             }
             log("MITM  " + host);
