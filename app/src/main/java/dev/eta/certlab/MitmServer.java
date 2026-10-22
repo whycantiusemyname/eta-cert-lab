@@ -90,6 +90,13 @@ final class MitmServer {
         try {
             loadTargets(ctx);
             loadSigner(ctx);
+            // Refuse to touch anything if the peek/replay path does not work on this
+            // device: port stays -1, Socket.connect is never rewritten and the app keeps
+            // talking to the network exactly as it would without the module.
+            if (!selfTest()) {
+                log("SELF TEST FAILED - interception disabled, traffic passes through untouched");
+                return;
+            }
             ServerSocket ss = new ServerSocket();
             ss.setReuseAddress(true);
             ss.bind(new InetSocketAddress("127.0.0.1", 0));
@@ -116,6 +123,71 @@ final class MitmServer {
     }
 
     // ------------------------------------------------------------- CA loading
+
+    /**
+     * Runs the whole peek -> replay -> terminate-TLS path once against itself. If the
+     * platform does not let us replay a ClientHello into an SSLSocket, we must not start
+     * intercepting at all: breaking the app's traffic is worse than doing nothing.
+     */
+    private static boolean selfTest() {
+        ServerSocket ss = null;
+        final boolean[] ok = {false};
+        try {
+            ss = new ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"));
+            final int p = ss.getLocalPort();
+            final ServerSocket fss = ss;
+            Thread srv = new Thread(() -> {
+                Socket c = null;
+                try {
+                    c = fss.accept();
+                    String[] sni = new String[1];
+                    byte[] hello = readClientHello(c.getInputStream(), sni);
+                    if (hello == null) return;
+                    ServerSocket bridge = new ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"));
+                    Socket feeder = new Socket("127.0.0.1", bridge.getLocalPort());
+                    Socket engine = bridge.accept();
+                    bridge.close();
+                    feeder.getOutputStream().write(hello);
+                    feeder.getOutputStream().flush();
+                    pump(c, feeder);
+                    pump(feeder, c);
+                    SNI_CAPTURED.set(normalizeHost(sni[0]) == null ? "probe.local" : normalizeHost(sni[0]));
+                    SSLSocket tls = openTls(engine, "probe.local");
+                    ok[0] = tls.getSession() != null;
+                    closeQuietly(tls);
+                } catch (Throwable t) {
+                    log("self test server failed: " + t);
+                } finally {
+                    SNI_CAPTURED.remove();
+                    closeQuietly(c);
+                }
+            }, "eta-selftest-srv");
+            srv.setDaemon(true);
+            srv.start();
+
+            SSLContext ctx = SSLContext.getInstance("TLS");
+            ctx.init(null, new javax.net.ssl.TrustManager[]{new javax.net.ssl.X509TrustManager() {
+                public void checkClientTrusted(X509Certificate[] c, String a) { }
+                public void checkServerTrusted(X509Certificate[] c, String a) { }
+                public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+            }}, null);
+            Socket raw = new Socket("127.0.0.1", p);
+            raw.setSoTimeout(8000);
+            SSLSocket client = (SSLSocket) ctx.getSocketFactory()
+                    .createSocket(raw, "probe.local", p, true);
+            client.setSoTimeout(8000);
+            client.startHandshake();
+            client.close();
+            srv.join(3000);
+            log("self test: " + (ok[0] ? "PASS (peek + replay + handshake)" : "FAIL (server side did not complete)"));
+            return ok[0];
+        } catch (Throwable t) {
+            log("self test failed: " + t);
+            return false;
+        } finally {
+            closeQuietly(ss);
+        }
+    }
 
     private static void loadSigner(Context ctx) throws Exception {
         AssetManager am = ctx.getAssets();
