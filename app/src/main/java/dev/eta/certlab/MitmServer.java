@@ -281,12 +281,14 @@ final class MitmServer {
      */
     private static void relayToReal(Socket c, byte[] hello, String host) {
         Socket up = null;
+        BYPASS.set(Boolean.TRUE);
         try {
             up = new Socket();
             up.connect(new InetSocketAddress(host, 443), 10000);
             up.setSoTimeout(RELAY_IDLE_MS);
             up.getOutputStream().write(hello);
             up.getOutputStream().flush();
+            BYPASS.set(Boolean.FALSE); // pumps only copy bytes, no connects
             c.setSoTimeout(RELAY_IDLE_MS);
             Thread up1 = pump(c, up);
             Thread up2 = pump(up, c);
@@ -295,6 +297,7 @@ final class MitmServer {
         } catch (Throwable e) {
             log("relay failed " + host + ": " + e);
         } finally {
+            BYPASS.set(Boolean.FALSE);
             closeQuietly(up);
             closeQuietly(c);
         }
