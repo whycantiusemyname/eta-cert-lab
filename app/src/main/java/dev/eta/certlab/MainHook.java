@@ -118,10 +118,15 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             if (bypassBlocklist) hookBlocklist(lpparam);
             if (injectCa) hookSslContext(lpparam);
+            // Install the network hooks immediately: they stay inert until the MITM server
+            // is up, and installing them this early means Application.onCreate()
+            // connections are covered as soon as it binds.
+            hookHostCapture();
+            hookInetLookup();
+            hookSocketRedirect();
             // Context is almost never ready this early, so the bind hook is what really
             // does the work: it runs once the Application object exists.
             hookBind(lpparam);
-            hookHostCapture();
             signLeafOnce();
             XposedBridge.log(TAG + ": loaded in " + lpparam.packageName);
         } catch (Throwable t) {
@@ -176,7 +181,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 return;
             }
             MitmServer.start(ctx, s -> XposedBridge.log(TAG + ": " + s));
-            hookSocketRedirect();
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": mitm start failed: " + t);
         }
@@ -202,7 +206,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     // never redirect our own connections or connections that already point here
                     String h = addr.getAddress() == null ? null : addr.getAddress().getHostAddress();
                     if (h != null && (h.equals("127.0.0.1") || h.equals("::1"))) return;
-                    MitmServer.noteHost(addr.getHostString());
+                    MitmServer.noteHostForAddress(addr);
                     param.args[0] = new java.net.InetSocketAddress("127.0.0.1", lp);
                 }
             });
@@ -218,8 +222,7 @@ public class MainHook implements IXposedHookLoadPackage {
      */
     private static boolean hostCaptureHooked;
 
-    private static void hookHostCapture() {
-        if (hostCaptureHooked) return;
+    private static void hookHostCapture() {        if (hostCaptureHooked) return;
         hostCaptureHooked = true;
         try {
             // hookAllMethods would trip over the abstract createSocket() overload and
@@ -243,6 +246,32 @@ public class MainHook implements IXposedHookLoadPackage {
                     });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": host capture failed: " + t);
+        }
+    }
+
+    /**
+     * OkHttp resolves names through InetAddress.getAllByName, which is the last place
+     * that still knows the real hostname once Clash has handed back a fake-IP.
+     */
+    private static boolean inetHooked;
+
+    private static void hookInetLookup() {
+        if (inetHooked) return;
+        inetHooked = true;
+        try {
+            XposedBridge.hookAllMethods(java.net.InetAddress.class, "getAllByName", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (param.args == null || param.args.length < 1) return;
+                    Object h = param.args[0];
+                    Object r = param.getResult();
+                    if (h instanceof String && r instanceof java.net.InetAddress[]) {
+                        MitmServer.noteHosts((java.net.InetAddress[]) r, (String) h);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": inet lookup hook failed: " + t);
         }
     }
 

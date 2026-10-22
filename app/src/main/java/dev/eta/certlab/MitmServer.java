@@ -69,12 +69,69 @@ final class MitmServer {
 
     /** Best-effort hostname capture for clients that never send SNI. */
     static void noteHost(String h) {
-        if (h == null) return;
+        String n = normalizeHost(h);
+        if (n != null) lastHost = n;
+    }
+
+    /**
+     * Clash hands the app a fake-IP, so Socket.connect() only ever sees 198.18.x.x.
+     * The DNS lookup that produced it does know the name, so remember the mapping.
+     */
+    private static final Map<String, String> IP2HOST =
+            new java.util.LinkedHashMap<String, String>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > 256;
+                }
+            };
+
+    static void noteHosts(java.net.InetAddress[] addrs, String host) {
+        if (addrs == null || host == null || host.length() < 4) return;
+        if (isIpLiteral(host)) return;
+        synchronized (IP2HOST) {
+            for (java.net.InetAddress a : addrs) {
+                if (a != null) IP2HOST.put(a.getHostAddress(), host);
+            }
+        }
+        noteHost(host);
+    }
+
+    static String hostForInet(java.net.InetAddress a) {
+        if (a == null) return null;
+        synchronized (IP2HOST) {
+            return IP2HOST.get(a.getHostAddress());
+        }
+    }
+
+    static void noteHostForAddress(InetSocketAddress addr) {
+        if (addr == null) return;
+        String mapped = hostForInet(addr.getAddress());
+        if (mapped != null) {
+            noteHost(mapped);
+            return;
+        }
+        noteHost(addr.getHostString());
+    }
+
+    private static boolean isIpLiteral(String s) {
+        if (s.indexOf(':') >= 0) return true; // IPv6
+        int dots = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '.') dots++;
+            else if (c < '0' || c > '9') return false;
+        }
+        return dots == 3;
+    }
+
+    /** Returns a usable DNS name, or null when nothing sensible is known. */
+    private static String normalizeHost(String h) {
+        if (h == null) return null;
         h = h.trim();
-        if (h.length() < 4 || h.length() > 255) return;
-        if (h.indexOf(' ') >= 0 || h.indexOf('/') >= 0) return;
-        if (h.equals("127.0.0.1") || h.equals("::1") || h.equals("localhost")) return;
-        lastHost = h;
+        if (h.isEmpty() || h.length() > 255) return null;
+        if (h.indexOf(' ') >= 0 || h.indexOf('/') >= 0) return null;
+        if (isIpLiteral(h) || h.equalsIgnoreCase("localhost")) return null;
+        return h.toLowerCase(java.util.Locale.ROOT);
     }
 
     static synchronized void start(Context ctx, Logger l) {
@@ -186,8 +243,11 @@ final class MitmServer {
             } catch (Throwable t) {
                 log("sni lookup failed: " + t);
             }
-            if (host == null || host.isEmpty()) host = lastHost;
-            if (host == null || host.isEmpty()) {
+            if (host == null || host.isEmpty() || isIpLiteral(host) || host.equalsIgnoreCase("localhost")) {
+                host = lastHost;
+            }
+            host = normalizeHost(host);
+            if (host == null) {
                 log("no SNI and no captured host, cannot sign");
                 return null;
             }
@@ -260,14 +320,17 @@ final class MitmServer {
                 }
             } catch (Throwable ignored) {
             }
-            if (sni == null || sni.isEmpty()) sni = lastHost;
+            if (sni == null || sni.isEmpty() || isIpLiteral(sni) || sni.equalsIgnoreCase("localhost")) {
+                sni = lastHost;
+            }
+            sni = normalizeHost(sni);
 
             byte[] req = readHttpRequest(tls.getInputStream());
             if (req == null) {
                 tls.close();
                 return;
             }
-            if (sni == null || sni.isEmpty()) {
+            if (sni == null) {
                 log("no target host for request, dropping");
                 try {
                     tls.getOutputStream().write(badGateway());
