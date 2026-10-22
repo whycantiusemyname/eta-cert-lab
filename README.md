@@ -27,7 +27,7 @@ app 会验证服务器证书是否链到系统信任库。三种情况实测结�
 
 ## 模块做什么
 
-1. **进程内 MITM**：hook `java.net.Socket.connect`，把目标端口 443 的连接改写到模块自己起的本地 TLS 端口（随机端口，只监听 127.0.0.1）；
+1. **进程内 MITM**：hook `java.net.Socket.connect`，**只**把目标域名的 443 连接改写到模块自己起的本地 TLS 端口（随机端口，只监听 127.0.0.1）；其他域名的连接原样直连，不经过任何中转；
 2. **按 SNI 现签 leaf**：自定义 `X509ExtendedKeyManager`，在 `chooseServerAlias` 里从 handshake session 取 SNI，用泄漏的 `EM OV TLS CA - G3C`（`d=4`）签证书；
 3. **组完整链**：发给客户端的是
    ```
@@ -51,6 +51,23 @@ EM-OV-TLS-CA-G3B=155  EM-OV-TLS-CA-G3C=4
 ```
 
 `app/src/main/assets/emudhra/` 里是这 8 张中间 CA 的**公开证书**以及把它们接到信任根的交叉证书，只用于组链。
+
+## 分流规则
+
+默认只拦截 `integrity.1nikolas.dev`。其余域名的 TCP 连接不动，直连对端——不改证书、不走两段 TLS，也就不会碰坏 app 里启用了证书固定的第三方流量。
+
+改范围写目标 app 私有目录下的 `files/eta-cert-lab/target.txt`，一行一个，`#` 注释：
+
+```
+integrity.1nikolas.dev
+*.1nikolas.dev
+playintegrity.googleapis.com
+```
+
+- `*.example.com` 同时匹配子域和裸域；
+- 只写一行 `*` 表示拦所有 443（调试用）。
+
+分流发生在 TCP 层，那时手上只有 IP，所以模块用 `InetAddress.getAllByName` 记下的 IP→域名映射反查。反查不到就不拦，日志会打 `skip <ip> (no hostname known for this address)`——宁可漏掉一条连接，也不去终结无关的 TLS。
 
 ## 使用
 

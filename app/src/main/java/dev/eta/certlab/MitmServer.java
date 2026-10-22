@@ -58,6 +58,10 @@ final class MitmServer {
 
     private static volatile int port = -1;
     private static volatile String lastHost;
+    /** domains to intercept; a single "*" means every connection */
+    private static volatile java.util.List<String> TARGETS =
+            java.util.Collections.singletonList(MainHook.DEFAULT_TARGET);
+    private static volatile boolean ALL_TRAFFIC;
     /** hostname reported by the SNI matcher for the connection being handshaken */
     private static final ThreadLocal<String> SNI_CAPTURED = new ThreadLocal<>();
     private static X509Certificate signerCert;
@@ -95,7 +99,6 @@ final class MitmServer {
                 if (a != null) IP2HOST.put(a.getHostAddress(), host);
             }
         }
-        noteHost(host);
     }
 
     static String hostForInet(java.net.InetAddress a) {
@@ -115,8 +118,7 @@ final class MitmServer {
         noteHost(addr.getHostString());
     }
 
-    private static boolean isIpLiteral(String s) {
-        if (s.indexOf(':') >= 0) return true; // IPv6
+    private static boolean isIpLiteral(String s) {        if (s.indexOf(':') >= 0) return true; // IPv6
         int dots = 0;
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
@@ -136,10 +138,82 @@ final class MitmServer {
         return h.toLowerCase(java.util.Locale.ROOT);
     }
 
+    // ------------------------------------------------------------- targeting
+
+    /** Reads files/eta-cert-lab/target.txt: one host per line, "#" comments, "*" = all. */
+    private static void loadTargets(Context ctx) {
+        java.util.List<String> list = new java.util.ArrayList<>();
+        java.io.File f = new java.io.File(ctx.getFilesDir(), "eta-cert-lab/target.txt");
+        if (f.exists()) {
+            try (java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    line = line.trim().toLowerCase(java.util.Locale.ROOT);
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    list.add(line);
+                }
+            } catch (Throwable t) {
+                log("target.txt unreadable: " + t);
+            }
+        }
+        if (list.isEmpty()) list.add(MainHook.DEFAULT_TARGET);
+        TARGETS = list;
+        ALL_TRAFFIC = list.contains("*");
+        log("intercept targets: " + list);
+    }
+
+    static boolean shouldInterceptHost(String host) {
+        String h = normalizeHost(host);
+        if (h == null) return false;
+        if (ALL_TRAFFIC) return true;
+        for (String p : TARGETS) {
+            if (targetMatches(p, h)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Decides whether a TCP connection is worth hijacking. At this point the only
+     * identity we have is the address, so we look it up in the DNS map; if that fails we
+     * let the connection through untouched rather than MITM somebody else's TLS.
+     */
+    static boolean shouldIntercept(InetSocketAddress addr) {
+        if (addr == null) return false;
+        if (ALL_TRAFFIC) return true;
+        String host = hostForInet(addr.getAddress());
+        if (host == null) {
+            warnUnknown(addr);
+            return false;
+        }
+        return shouldInterceptHost(host);
+    }
+
+    private static final Map<String, Boolean> WARNED = new HashMap<>();
+
+    private static void warnUnknown(InetSocketAddress addr) {
+        if (addr.getAddress() == null) return;
+        String ip = addr.getAddress().getHostAddress();
+        synchronized (WARNED) {
+            if (WARNED.size() > 32 || WARNED.put(ip, Boolean.TRUE) != null) return;
+        }
+        log("skip " + ip + " (no hostname known for this address)");
+    }
+
+    private static boolean targetMatches(String pattern, String host) {
+        if (pattern.equals("*")) return true;
+        if (pattern.startsWith("*.")) {
+            String bare = pattern.substring(2);
+            return host.equals(bare) || host.endsWith("." + bare);
+        }
+        return host.equals(pattern);
+    }
+
     static synchronized void start(Context ctx, Logger l) {
         if (port > 0) return;
         logger = l;
         try {
+            loadTargets(ctx);
             loadSigner(ctx);
             ServerSocket ss = new ServerSocket();
             ss.setReuseAddress(true);

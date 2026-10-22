@@ -119,8 +119,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static boolean bypassBlocklist = true;
     /** write a demo leaf for the configured host into the app's private dir */
     private static boolean signLeaf = true;
+    static final String DEFAULT_TARGET = "integrity.1nikolas.dev";
     /** hostname to sign for; overridden by files/eta-cert-lab/target.txt */
-    private static String targetHost = "integrity.1nikolas.dev";
+    private static String targetHost = DEFAULT_TARGET;
 
     private static X509Certificate caCert;
     private static volatile boolean caLoaded;
@@ -232,6 +233,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     // never redirect our own connections or connections that already point here
                     String h = addr.getAddress() == null ? null : addr.getAddress().getHostAddress();
                     if (h != null && (h.equals("127.0.0.1") || h.equals("::1"))) return;
+                    if (!MitmServer.shouldIntercept(addr)) return;
                     MitmServer.noteHostForAddress(addr);
                     param.args[0] = new java.net.InetSocketAddress("127.0.0.1", lp);
                 }
@@ -259,7 +261,9 @@ public class MainHook implements IXposedHookLoadPackage {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             Object a = param.args[1];
-                            if (a instanceof String) MitmServer.noteHost((String) a);
+                            if (a instanceof String && MitmServer.shouldInterceptHost((String) a)) {
+                                MitmServer.noteHost((String) a);
+                            }
                         }
                     });
             XposedHelpers.findAndHookMethod(SSLSocketFactory.class, "createSocket",
@@ -267,7 +271,9 @@ public class MainHook implements IXposedHookLoadPackage {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             Object a = param.args[0];
-                            if (a instanceof String) MitmServer.noteHost((String) a);
+                            if (a instanceof String && MitmServer.shouldInterceptHost((String) a)) {
+                                MitmServer.noteHost((String) a);
+                            }
                         }
                     });
         } catch (Throwable t) {
@@ -375,12 +381,17 @@ public class MainHook implements IXposedHookLoadPackage {
             String host = targetHost;
             File hostFile = new File(dir, "target.txt");
             if (hostFile.exists()) {
-                byte[] raw;
-                try (FileInputStream fin = new FileInputStream(hostFile)) {
-                    raw = readAll(fin);
+                try (java.io.BufferedReader r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(new FileInputStream(hostFile), "UTF-8"))) {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        line = line.trim();
+                        if (line.isEmpty() || line.startsWith("#")) continue;
+                        if (line.equals("*") || line.startsWith("*.")) continue;
+                        host = line;
+                        break;
+                    }
                 }
-                String s = new String(raw, "UTF-8").trim();
-                if (s.length() > 0) host = s;
             }
 
             X509Certificate intermediate = loadIntermediate(ctx.getAssets(), SIGNER_NAME);
