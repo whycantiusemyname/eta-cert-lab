@@ -54,9 +54,17 @@ EM-OV-TLS-CA-G3B=155  EM-OV-TLS-CA-G3C=4
 
 ## 分流规则
 
-默认只拦截 `integrity.1nikolas.dev`。其余域名的 TCP 连接不动，直连对端——不改证书、不走两段 TLS，也就不会碰坏 app 里启用了证书固定的第三方流量。
+所有 443 连接都先接到本地——TCP 层只认 IP，这里放行就会漏。但接住之后**不盲目终结 TLS**：先读 ClientHello、解析出 SNI，再决定这条连接的命运。
 
-改范围写目标 app 私有目录下的 `files/eta-cert-lab/target.txt`，一行一个，`#` 注释：
+| SNI | 处理 |
+|---|---|
+| 命中 `target.txt` | 本地终结 TLS，用泄漏的 eMudhra 中间 CA 现签 leaf，请求解析后原样转发 |
+| 其他域名 | 把已读的 ClientHello 连同后续字节在 **TCP 层拼接**到真实服务器，TLS 全程端到端 |
+| 解析不出 SNI，也没有已知域名 | 断开并记日志，不猜 |
+
+所以“其他流量透传”是真的透传：证书不换、pinning 不受影响、WebSocket/gRPC 这类长连接照常工作，代价只是多一跳 loopback。
+
+默认只拦 `integrity.1nikolas.dev`。改范围写目标 app 私有目录下的 `files/eta-cert-lab/target.txt`，一行一个，`#` 注释：
 
 ```
 integrity.1nikolas.dev
@@ -65,9 +73,9 @@ playintegrity.googleapis.com
 ```
 
 - `*.example.com` 同时匹配子域和裸域；
-- 只写一行 `*` 表示拦所有 443（调试用）。
+- 只写一行 `*` 表示所有连接都终结 TLS（调试用，会碰坏 pinning）。
 
-分流发生在 TCP 层，那时手上只有 IP，所以模块用 `InetAddress.getAllByName` 记下的 IP→域名映射反查。反查不到就不拦，日志会打 `skip <ip> (no hostname known for this address)`——宁可漏掉一条连接，也不去终结无关的 TLS。
+另外有一个纯优化：如果 IP 反查能确定某个连接**不是**目标，就在 TCP 层直接放行，省掉 loopback 一跳；反查不出来时一律接住交给 SNI 判断。这个优化永远不会导致漏拦，最坏情况只是多一跳。
 
 ## 使用
 

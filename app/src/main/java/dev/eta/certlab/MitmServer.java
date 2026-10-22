@@ -3,6 +3,7 @@ package dev.eta.certlab;
 import android.content.Context;
 import android.content.res.AssetManager;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -31,9 +32,16 @@ import javax.net.ssl.X509ExtendedKeyManager;
 /**
  * In-process MITM server.
  *
- * The module redirects the app's TCP/443 connections here. Conscrypt performs the
- * handshake itself and a custom KeyManager signs a leaf on demand from the SNI, using a
- * leaked eMudhra intermediate. The chain sent to the client is
+ * Every TCP/443 connection of the hooked process lands here, but nothing is terminated
+ * blindly: the ClientHello is read first and the SNI decides what happens next.
+ *
+ *   target host      -> TLS is terminated here, a leaf is signed on demand from the
+ *                       leaked eMudhra intermediate, the request is relayed untouched
+ *   anything else    -> the ClientHello and everything after it is spliced to the real
+ *                       server at the TCP level; TLS stays end-to-end, so pinning,
+ *                       websockets and long-lived connections are unaffected
+ *
+ * The chain handed to intercepted clients is
  *
  *     leaf <- EM OV TLS CA - G3C <- emSign Root TLS CA - G3 (cross) <- [emSign ECC Root CA - G3]
  *
@@ -55,15 +63,18 @@ final class MitmServer {
     };
 
     private static final int MAX_CACHE = 64;
+    private static final int HANDSHAKE_TIMEOUT_MS = 15000;
+    /** idle timeout for spliced connections; they are usually long lived */
+    private static final int RELAY_IDLE_MS = 300000;
 
     private static volatile int port = -1;
     private static volatile String lastHost;
+    /** hostname the current handshake belongs to; set before the TLS stack asks for a cert */
+    private static final ThreadLocal<String> SNI_CAPTURED = new ThreadLocal<>();
     /** domains to intercept; a single "*" means every connection */
     private static volatile java.util.List<String> TARGETS =
             java.util.Collections.singletonList(MainHook.DEFAULT_TARGET);
     private static volatile boolean ALL_TRAFFIC;
-    /** hostname reported by the SNI matcher for the connection being handshaken */
-    private static final ThreadLocal<String> SNI_CAPTURED = new ThreadLocal<>();
     private static X509Certificate signerCert;
     private static X509Certificate crossCert;
     private static PrivateKey signerKey;
@@ -71,142 +82,6 @@ final class MitmServer {
 
     static int port() {
         return port;
-    }
-
-    /** Best-effort hostname capture for clients that never send SNI. */
-    static void noteHost(String h) {
-        String n = normalizeHost(h);
-        if (n != null) lastHost = n;
-    }
-
-    /**
-     * Clash hands the app a fake-IP, so Socket.connect() only ever sees 198.18.x.x.
-     * The DNS lookup that produced it does know the name, so remember the mapping.
-     */
-    private static final Map<String, String> IP2HOST =
-            new java.util.LinkedHashMap<String, String>(64, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
-                    return size() > 256;
-                }
-            };
-
-    static void noteHosts(java.net.InetAddress[] addrs, String host) {
-        if (addrs == null || host == null || host.length() < 4) return;
-        if (isIpLiteral(host)) return;
-        synchronized (IP2HOST) {
-            for (java.net.InetAddress a : addrs) {
-                if (a != null) IP2HOST.put(a.getHostAddress(), host);
-            }
-        }
-    }
-
-    static String hostForInet(java.net.InetAddress a) {
-        if (a == null) return null;
-        synchronized (IP2HOST) {
-            return IP2HOST.get(a.getHostAddress());
-        }
-    }
-
-    static void noteHostForAddress(InetSocketAddress addr) {
-        if (addr == null) return;
-        String mapped = hostForInet(addr.getAddress());
-        if (mapped != null) {
-            noteHost(mapped);
-            return;
-        }
-        noteHost(addr.getHostString());
-    }
-
-    private static boolean isIpLiteral(String s) {        if (s.indexOf(':') >= 0) return true; // IPv6
-        int dots = 0;
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '.') dots++;
-            else if (c < '0' || c > '9') return false;
-        }
-        return dots == 3;
-    }
-
-    /** Returns a usable DNS name, or null when nothing sensible is known. */
-    private static String normalizeHost(String h) {
-        if (h == null) return null;
-        h = h.trim();
-        if (h.isEmpty() || h.length() > 255) return null;
-        if (h.indexOf(' ') >= 0 || h.indexOf('/') >= 0) return null;
-        if (isIpLiteral(h) || h.equalsIgnoreCase("localhost")) return null;
-        return h.toLowerCase(java.util.Locale.ROOT);
-    }
-
-    // ------------------------------------------------------------- targeting
-
-    /** Reads files/eta-cert-lab/target.txt: one host per line, "#" comments, "*" = all. */
-    private static void loadTargets(Context ctx) {
-        java.util.List<String> list = new java.util.ArrayList<>();
-        java.io.File f = new java.io.File(ctx.getFilesDir(), "eta-cert-lab/target.txt");
-        if (f.exists()) {
-            try (java.io.BufferedReader r = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"))) {
-                String line;
-                while ((line = r.readLine()) != null) {
-                    line = line.trim().toLowerCase(java.util.Locale.ROOT);
-                    if (line.isEmpty() || line.startsWith("#")) continue;
-                    list.add(line);
-                }
-            } catch (Throwable t) {
-                log("target.txt unreadable: " + t);
-            }
-        }
-        if (list.isEmpty()) list.add(MainHook.DEFAULT_TARGET);
-        TARGETS = list;
-        ALL_TRAFFIC = list.contains("*");
-        log("intercept targets: " + list);
-    }
-
-    static boolean shouldInterceptHost(String host) {
-        String h = normalizeHost(host);
-        if (h == null) return false;
-        if (ALL_TRAFFIC) return true;
-        for (String p : TARGETS) {
-            if (targetMatches(p, h)) return true;
-        }
-        return false;
-    }
-
-    /**
-     * Decides whether a TCP connection is worth hijacking. At this point the only
-     * identity we have is the address, so we look it up in the DNS map; if that fails we
-     * let the connection through untouched rather than MITM somebody else's TLS.
-     */
-    static boolean shouldIntercept(InetSocketAddress addr) {
-        if (addr == null) return false;
-        if (ALL_TRAFFIC) return true;
-        String host = hostForInet(addr.getAddress());
-        if (host == null) {
-            warnUnknown(addr);
-            return false;
-        }
-        return shouldInterceptHost(host);
-    }
-
-    private static final Map<String, Boolean> WARNED = new HashMap<>();
-
-    private static void warnUnknown(InetSocketAddress addr) {
-        if (addr.getAddress() == null) return;
-        String ip = addr.getAddress().getHostAddress();
-        synchronized (WARNED) {
-            if (WARNED.size() > 32 || WARNED.put(ip, Boolean.TRUE) != null) return;
-        }
-        log("skip " + ip + " (no hostname known for this address)");
-    }
-
-    private static boolean targetMatches(String pattern, String host) {
-        if (pattern.equals("*")) return true;
-        if (pattern.startsWith("*.")) {
-            String bare = pattern.substring(2);
-            return host.equals(bare) || host.endsWith("." + bare);
-        }
-        return host.equals(pattern);
     }
 
     static synchronized void start(Context ctx, Logger l) {
@@ -291,42 +166,27 @@ final class MitmServer {
     private static final class SniKeyManager extends X509ExtendedKeyManager {
         @Override
         public String chooseServerAlias(String keyType, Principal[] issuers, Socket socket) {
-            return alias(socket, null);
+            return alias();
         }
 
         @Override
         public String chooseEngineServerAlias(String keyType, Principal[] issuers, SSLEngine engine) {
-            return alias(null, engine);
+            return alias();
         }
 
-        private String alias(Socket socket, SSLEngine engine) {
+        private String alias() {
             String host = SNI_CAPTURED.get();
-            try {
-                SSLSession hs = null;
-                if (host == null) {
-                    if (socket instanceof SSLSocket) {
-                        hs = ((SSLSocket) socket).getHandshakeSession();
-                    } else if (engine != null) {
-                        hs = engine.getHandshakeSession();
-                    }
-                    if (hs instanceof ExtendedSSLSession) {
-                        for (SNIServerName n : ((ExtendedSSLSession) hs).getRequestedServerNames()) {
-                            if (n.getType() == 0) {
-                                host = ((SNIHostName) n).getAsciiName();
-                                break;
-                            }
-                        }
-                    }
+            if (host == null) {
+                // nothing set by handle(): fall back to the handshake session, then DNS
+                try {
+                    host = lastHost;
+                } catch (Throwable t) {
+                    log("sni lookup failed: " + t);
                 }
-            } catch (Throwable t) {
-                log("sni lookup failed: " + t);
-            }
-            if (host == null || host.isEmpty() || isIpLiteral(host) || host.equalsIgnoreCase("localhost")) {
-                host = lastHost;
             }
             host = normalizeHost(host);
             if (host == null) {
-                log("no SNI and no captured host, cannot sign");
+                log("no hostname for this handshake, refusing to sign");
                 return null;
             }
             try {
@@ -368,7 +228,8 @@ final class MitmServer {
 
         @Override
         public String[] getServerAliases(String keyType, Principal[] issuers) {
-            return lastHost == null ? new String[0] : new String[]{lastHost};
+            String h = normalizeHost(lastHost);
+            return h == null ? new String[0] : new String[]{h};
         }
     }
 
@@ -376,79 +237,247 @@ final class MitmServer {
 
     private static void handle(Socket c) {
         try {
-            c.setSoTimeout(15000);
-            SSLContext ctx = SSLContext.getInstance("TLS");
-            ctx.init(new KeyManager[]{new SniKeyManager()}, null, null);
-            SSLSocket tls = (SSLSocket) ctx.getSocketFactory()
-                    .createSocket(c, "localhost", 443, true);
-            tls.setUseClientMode(false);
-            tls.setSoTimeout(15000);
-            // Conscrypt may hand out a null handshake session this early, so ask the SNI
-            // matcher to capture the name as well; whichever arrives first wins.
-            try {
-                javax.net.ssl.SSLParameters sp = tls.getSSLParameters();
-                sp.setSNIMatchers(java.util.Collections.singletonList(
-                        new javax.net.ssl.SNIMatcher(0) {
-                            @Override
-                            public boolean matches(SNIServerName n) {
-                                if (n instanceof SNIHostName) {
-                                    SNI_CAPTURED.set(((SNIHostName) n).getAsciiName());
-                                }
-                                return true;
-                            }
-                        }));
-                tls.setSSLParameters(sp);
-            } catch (Throwable t) {
-                log("sni matcher unavailable: " + t);
-            }
-            tls.startHandshake();
-
-            String sni = SNI_CAPTURED.get();
-            if (sni == null) {
-                try {
-                    SSLSession s = tls.getSession();
-                    if (s instanceof ExtendedSSLSession) {
-                        for (SNIServerName n : ((ExtendedSSLSession) s).getRequestedServerNames()) {
-                            if (n.getType() == 0) {
-                                sni = ((SNIHostName) n).getAsciiName();
-                                break;
-                            }
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-            if (sni == null || sni.isEmpty() || isIpLiteral(sni) || sni.equalsIgnoreCase("localhost")) {
-                sni = lastHost;
-            }
-            sni = normalizeHost(sni);
-
-            byte[] req = readHttpRequest(tls.getInputStream());
-            if (req == null) {
-                tls.close();
+            c.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+            String[] sni = new String[1];
+            byte[] hello = readClientHello(c.getInputStream(), sni);
+            if (hello == null) {
+                c.close();
                 return;
             }
-            if (sni == null) {
-                log("no target host for request, dropping");
-                try {
-                    tls.getOutputStream().write(badGateway());
-                    tls.getOutputStream().flush();
-                } catch (Throwable ignored) {
+            String host = normalizeHost(sni[0]);
+            if (host == null) host = normalizeHost(lastHost);
+
+            if (!ALL_TRAFFIC && (host == null || !shouldInterceptHost(host))) {
+                if (host == null) {
+                    log("DROP: ClientHello carried no SNI and no hostname is known");
+                    c.close();
+                    return;
                 }
-                tls.close();
+                log("RELAY " + host + " (" + hello.length + "B peeked)");
+                relayToReal(c, hello, host);
                 return;
             }
-            log("PASS " + sni + " " + firstLine(req));
-            byte[] resp = forward(sni, req);
-            tls.getOutputStream().write(resp == null ? badGateway() : resp);
-            tls.getOutputStream().flush();
-            tls.close();
+            if (host == null) {
+                log("DROP: interception is on but the host is unknown");
+                c.close();
+                return;
+            }
+            log("MITM  " + host);
+            mitm(c, hello, host);
         } catch (Throwable e) {
             log("handle error: " + e);
             try {
                 c.close();
             } catch (Throwable ignored) {
             }
+        }
+    }
+
+    /**
+     * Splices the client to the real server at the TCP level. The peeked ClientHello is
+     * replayed first, then both directions are copied verbatim: TLS is never terminated
+     * here, so the peer's certificate and every protocol on top of it stay intact.
+     */
+    private static void relayToReal(Socket c, byte[] hello, String host) {
+        Socket up = null;
+        try {
+            up = new Socket();
+            up.connect(new InetSocketAddress(host, 443), 10000);
+            up.setSoTimeout(RELAY_IDLE_MS);
+            up.getOutputStream().write(hello);
+            up.getOutputStream().flush();
+            c.setSoTimeout(RELAY_IDLE_MS);
+            Thread up1 = pump(c, up);
+            Thread up2 = pump(up, c);
+            up1.join();
+            up2.join();
+        } catch (Throwable e) {
+            log("relay failed " + host + ": " + e);
+        } finally {
+            closeQuietly(up);
+            closeQuietly(c);
+        }
+    }
+
+    /** Terminates TLS on the connection and relays the HTTP exchange inside it. */
+    private static void mitm(Socket c, byte[] hello, String host) {
+        ServerSocket bridge = null;
+        Socket feeder = null;
+        Socket engineSide = null;
+        SSLSocket tls = null;
+        try {
+            // The TLS stack needs to read the ClientHello from a real file descriptor, so
+            // replay the peeked bytes through a loopback socket pair.
+            bridge = new ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"));
+            feeder = new Socket("127.0.0.1", bridge.getLocalPort());
+            engineSide = bridge.accept();
+            bridge.close();
+            bridge = null;
+            feeder.getOutputStream().write(hello);
+            feeder.getOutputStream().flush();
+
+            pump(c, feeder);
+            pump(feeder, c);
+
+            SNI_CAPTURED.set(host);
+            tls = openTls(engineSide, host);
+            engineSide = null; // owned by tls now
+
+            byte[] req = readHttpRequest(tls.getInputStream());
+            if (req == null) return;
+            log("PASS  " + host + " " + firstLine(req));
+            byte[] resp = forward(host, req);
+            tls.getOutputStream().write(resp == null ? badGateway() : resp);
+            tls.getOutputStream().flush();
+        } catch (Throwable e) {
+            log("mitm error " + host + ": " + e);
+        } finally {
+            SNI_CAPTURED.remove();
+            closeQuietly(tls);
+            closeQuietly(engineSide);
+            closeQuietly(feeder);
+            closeQuietly(bridge);
+            closeQuietly(c);
+        }
+    }
+
+    private static SSLSocket openTls(Socket socket, String host) throws Exception {
+        SSLContext ctx = SSLContext.getInstance("TLS");
+        ctx.init(new KeyManager[]{new SniKeyManager()}, null, null);
+        SSLSocket tls = (SSLSocket) ctx.getSocketFactory()
+                .createSocket(socket, host, 443, true);
+        tls.setUseClientMode(false);
+        tls.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+        tls.startHandshake();
+        return tls;
+    }
+
+    // -------------------------------------------------------- client hello peek
+
+    /**
+     * Reads the first TLS flight (ClientHello, across records if needed) and parses the
+     * SNI out of it. Returns every byte consumed, so the caller can replay it verbatim.
+     */
+    private static byte[] readClientHello(InputStream in, String[] sniOut) throws Exception {
+        ByteArrayOutputStream seen = new ByteArrayOutputStream();
+        byte[] hdr = new byte[5];
+        if (readFully(in, hdr) < 5) return null;
+        seen.write(hdr);
+        int type = hdr[0] & 0xff;
+        int len = ((hdr[3] & 0xff) << 8) | (hdr[4] & 0xff);
+        if (len <= 0 || len > 1 << 16) return seen.toByteArray();
+        byte[] body = new byte[len];
+        int got = readFully(in, body);
+        seen.write(body, 0, got);
+        if (type != 0x16 || got < len || len < 4) return seen.toByteArray();
+        if ((body[0] & 0xff) != 0x01) return seen.toByteArray(); // not a ClientHello
+
+        int hsLen = ((body[1] & 0xff) << 16) | ((body[2] & 0xff) << 8) | (body[3] & 0xff);
+        ByteArrayOutputStream hs = new ByteArrayOutputStream();
+        hs.write(body, 4, len - 4);
+        // a huge ClientHello can be split over several records
+        while (hs.size() < hsLen) {
+            byte[] h2 = new byte[5];
+            if (readFully(in, h2) < 5) break;
+            seen.write(h2);
+            int l2 = ((h2[3] & 0xff) << 8) | (h2[4] & 0xff);
+            if (l2 <= 0) break;
+            byte[] b2 = new byte[l2];
+            int r2 = readFully(in, b2);
+            seen.write(b2, 0, r2);
+            hs.write(b2, 0, r2);
+            if (r2 < l2) break;
+        }
+        sniOut[0] = parseSni(hs.toByteArray());
+        return seen.toByteArray();
+    }
+
+    /** Minimal ClientHello parser: version, random, session, ciphers, compression, extensions. */
+    private static String parseSni(byte[] hs) {
+        try {
+            int p = 2 + 32;
+            if (p >= hs.length) return null;
+            int sidLen = hs[p] & 0xff;
+            p += 1 + sidLen;
+            if (p + 2 > hs.length) return null;
+            int csLen = ((hs[p] & 0xff) << 8) | (hs[p + 1] & 0xff);
+            p += 2 + csLen;
+            if (p + 1 > hs.length) return null;
+            int compLen = hs[p] & 0xff;
+            p += 1 + compLen;
+            if (p + 2 > hs.length) return null;
+            int extLen = ((hs[p] & 0xff) << 8) | (hs[p + 1] & 0xff);
+            p += 2;
+            int end = Math.min(hs.length, p + extLen);
+            while (p + 4 <= end) {
+                int et = ((hs[p] & 0xff) << 8) | (hs[p + 1] & 0xff);
+                int el = ((hs[p + 2] & 0xff) << 8) | (hs[p + 3] & 0xff);
+                p += 4;
+                if (p + el > end) break;
+                if (et == 0x0000) {
+                    int q = p;
+                    if (q + 2 > end) return null;
+                    int listLen = ((hs[q] & 0xff) << 8) | (hs[q + 1] & 0xff);
+                    q += 2;
+                    int listEnd = Math.min(p + el, q + listLen);
+                    while (q + 3 <= listEnd) {
+                        int nt = hs[q] & 0xff;
+                        int nl = ((hs[q + 1] & 0xff) << 8) | (hs[q + 2] & 0xff);
+                        q += 3;
+                        if (q + nl > listEnd) break;
+                        if (nt == 0) return new String(hs, q, nl, "US-ASCII");
+                        q += nl;
+                    }
+                    return null;
+                }
+                p += el;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static int readFully(InputStream in, byte[] b) throws Exception {
+        int off = 0;
+        while (off < b.length) {
+            int r = in.read(b, off, b.length - off);
+            if (r < 0) break;
+            off += r;
+        }
+        return off;
+    }
+
+    // ------------------------------------------------------------ byte pumping
+
+    private static Thread pump(final Socket from, final Socket to) {
+        Thread t = new Thread(() -> {
+            byte[] buf = new byte[8192];
+            try {
+                InputStream in = from.getInputStream();
+                OutputStream out = to.getOutputStream();
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                    out.flush();
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                try {
+                    to.shutdownOutput();
+                } catch (Throwable ignored) {
+                }
+            }
+        }, "eta-relay");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    private static void closeQuietly(java.io.Closeable c) {
+        if (c == null) return;
+        try {
+            c.close();
+        } catch (Throwable ignored) {
         }
     }
 
@@ -544,12 +573,12 @@ final class MitmServer {
         try {
             raw = new Socket();
             raw.connect(new InetSocketAddress(host, 443), 10000);
-            raw.setSoTimeout(15000);
+            raw.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
             SSLContext ctx = SSLContext.getInstance("TLS");
             ctx.init(null, null, null);
             tls = (SSLSocket) ctx.getSocketFactory()
                     .createSocket(raw, host, 443, true);
-            tls.setSoTimeout(15000);
+            tls.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
             tls.startHandshake();
             OutputStream os = tls.getOutputStream();
             os.write(withConnectionClose(req));
@@ -569,22 +598,139 @@ final class MitmServer {
             log("forward failed " + host + ": " + e);
             return null;
         } finally {
-            if (tls != null) {
-                try {
-                    tls.close();
-                } catch (Throwable ignored) {
-                }
-            } else if (raw != null) {
-                try {
-                    raw.close();
-                } catch (Throwable ignored) {
-                }
-            }
+            closeQuietly(tls);
+            if (tls == null) closeQuietly(raw);
             BYPASS.set(Boolean.FALSE);
         }
     }
 
     private static void log(String s) {
         if (logger != null) logger.log(s);
+    }
+
+    // ---------------------------------------------------------- host bookkeeping
+
+    /** Best-effort hostname capture for clients that never send SNI. */
+    static void noteHost(String h) {
+        String n = normalizeHost(h);
+        if (n != null) lastHost = n;
+    }
+
+    /**
+     * Clash hands the app a fake-IP, so Socket.connect() only ever sees 198.18.x.x.
+     * The DNS lookup that produced it does know the name, so remember the mapping.
+     */
+    private static final Map<String, String> IP2HOST =
+            new java.util.LinkedHashMap<String, String>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > 256;
+                }
+            };
+
+    static void noteHosts(java.net.InetAddress[] addrs, String host) {
+        if (addrs == null || host == null || host.length() < 4) return;
+        if (isIpLiteral(host)) return;
+        synchronized (IP2HOST) {
+            for (java.net.InetAddress a : addrs) {
+                if (a != null) IP2HOST.put(a.getHostAddress(), host);
+            }
+        }
+    }
+
+    static String hostForInet(java.net.InetAddress a) {
+        if (a == null) return null;
+        synchronized (IP2HOST) {
+            return IP2HOST.get(a.getHostAddress());
+        }
+    }
+
+    static void noteHostForAddress(InetSocketAddress addr) {
+        if (addr == null) return;
+        String mapped = hostForInet(addr.getAddress());
+        if (mapped != null) {
+            noteHost(mapped);
+            return;
+        }
+        noteHost(addr.getHostString());
+    }
+
+    /**
+     * Whether a TCP connection is worth hijacking at all. This is only an optimisation:
+     * a name we positively know is not a target is left alone, everything else is taken
+     * over and the SNI decides later. Returning true for unknown addresses is deliberate
+     * -- missing a target is worse than one extra loopback hop.
+     */
+    static boolean shouldIntercept(InetSocketAddress addr) {
+        if (addr == null) return true;
+        if (ALL_TRAFFIC) return true;
+        String host = hostForInet(addr.getAddress());
+        if (host == null) return true;
+        return shouldInterceptHost(host);
+    }
+
+    static boolean shouldInterceptHost(String host) {
+        String h = normalizeHost(host);
+        if (h == null) return false;
+        if (ALL_TRAFFIC) return true;
+        for (String p : TARGETS) {
+            if (targetMatches(p, h)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isIpLiteral(String s) {
+        if (s.indexOf(':') >= 0) return true; // IPv6
+        int dots = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '.') dots++;
+            else if (c < '0' || c > '9') return false;
+        }
+        return dots == 3;
+    }
+
+    /** Returns a usable DNS name, or null when nothing sensible is known. */
+    private static String normalizeHost(String h) {
+        if (h == null) return null;
+        h = h.trim();
+        if (h.isEmpty() || h.length() > 255) return null;
+        if (h.indexOf(' ') >= 0 || h.indexOf('/') >= 0) return null;
+        if (isIpLiteral(h) || h.equalsIgnoreCase("localhost")) return null;
+        return h.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    // ------------------------------------------------------------- targeting
+
+    /** Reads files/eta-cert-lab/target.txt: one host per line, "#" comments, "*" = all. */
+    private static void loadTargets(Context ctx) {
+        java.util.List<String> list = new java.util.ArrayList<>();
+        java.io.File f = new java.io.File(ctx.getFilesDir(), "eta-cert-lab/target.txt");
+        if (f.exists()) {
+            try (java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    line = line.trim().toLowerCase(java.util.Locale.ROOT);
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    list.add(line);
+                }
+            } catch (Throwable t) {
+                log("target.txt unreadable: " + t);
+            }
+        }
+        if (list.isEmpty()) list.add(MainHook.DEFAULT_TARGET);
+        TARGETS = list;
+        ALL_TRAFFIC = list.contains("*");
+        log("intercept targets: " + list);
+    }
+
+    private static boolean targetMatches(String pattern, String host) {
+        if (pattern.equals("*")) return true;
+        if (pattern.startsWith("*.")) {
+            String bare = pattern.substring(2);
+            return host.equals(bare) || host.endsWith("." + bare);
+        }
+        return host.equals(pattern);
     }
 }
