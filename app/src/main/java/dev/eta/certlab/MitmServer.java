@@ -1,7 +1,6 @@
 package dev.eta.certlab;
 
 import android.content.Context;
-import android.content.res.AssetManager;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -89,7 +88,7 @@ final class MitmServer {
         logger = l;
         try {
             loadTargets(ctx);
-            loadSigner(ctx);
+            loadSigner();
             // Refuse to touch anything if the peek/replay path does not work on this
             // device: port stays -1, Socket.connect is never rewritten and the app keeps
             // talking to the network exactly as it would without the module.
@@ -189,10 +188,9 @@ final class MitmServer {
         }
     }
 
-    private static void loadSigner(Context ctx) throws Exception {
-        AssetManager am = ctx.getAssets();
-        signerCert = MainHook.loadIntermediate(am, MainHook.SIGNER_NAME);
-        crossCert = MainHook.loadIntermediate(am, MainHook.CROSS_NAME);
+    private static void loadSigner() throws Exception {
+        signerCert = MainHook.loadIntermediate(MainHook.SIGNER_NAME);
+        crossCert = MainHook.loadIntermediate(MainHook.CROSS_NAME);
         Integer d = MainHook.EMUDHRA_KEYS.get(MainHook.SIGNER_NAME);
         if (d == null) throw new IllegalStateException("no leaked key for " + MainHook.SIGNER_NAME);
         signerKey = MainHook.deriveKey(d);

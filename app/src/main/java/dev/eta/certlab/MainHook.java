@@ -1,7 +1,6 @@
 package dev.eta.certlab;
 
 import android.content.Context;
-import android.content.res.AssetManager;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -120,6 +119,7 @@ public class MainHook implements IXposedHookLoadPackage {
     /** write a demo leaf for the configured host into the app's private dir */
     private static boolean signLeaf = true;
     static final String DEFAULT_TARGET = "integrity.1nikolas.dev";
+    static final String MODULE_PKG = "dev.eta.certlab";
     /** hostname to sign for; overridden by files/eta-cert-lab/target.txt */
     private static String targetHost = DEFAULT_TARGET;
 
@@ -311,14 +311,39 @@ public class MainHook implements IXposedHookLoadPackage {
         return kf.generatePrivate(new ECPrivateKeySpec(BigInteger.valueOf(d), spec));
     }
 
-    /** Load an intermediate certificate from assets/emudhra/<name>.crt.pem */
-    static X509Certificate loadIntermediate(AssetManager am, String name) throws Exception {
-        InputStream in = am.open(EMU_DIR + "/" + name + ".crt.pem");
+    /** Load an intermediate certificate out of the module's own assets/emudhra/. */
+    static X509Certificate loadIntermediate(String name) throws Exception {
+        byte[] pem = readModuleAsset(EMU_DIR + "/" + name + ".crt.pem");
+        return (X509Certificate) CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(pem));
+    }
+
+    /**
+     * Reads a file from the module APK. appContext() is the *host* app, whose assets
+     * obviously do not contain our certificates, so we need the module's own resources --
+     * via createPackageContext when possible, and straight out of the APK otherwise.
+     */
+    static byte[] readModuleAsset(String path) throws Exception {
+        Context mod = moduleContext();
+        if (mod != null) {
+            try (InputStream in = mod.getAssets().open(path)) {
+                return readAll(in);
+            } catch (Throwable ignored) {
+            }
+        }
+        Context app = appContext();
+        if (app == null) throw new IllegalStateException("no context for module assets");
+        String apk = app.getPackageManager()
+                .getApplicationInfo(MODULE_PKG, 0).sourceDir;
+        java.util.zip.ZipFile zf = new java.util.zip.ZipFile(apk);
         try {
-            return (X509Certificate) CertificateFactory.getInstance("X.509")
-                    .generateCertificate(new ByteArrayInputStream(readAll(in)));
+            java.util.zip.ZipEntry e = zf.getEntry("assets/" + path);
+            if (e == null) throw new java.io.FileNotFoundException("assets/" + path + " in " + apk);
+            try (InputStream in = zf.getInputStream(e)) {
+                return readAll(in);
+            }
         } finally {
-            in.close();
+            zf.close();
         }
     }
 
@@ -387,7 +412,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
 
-            X509Certificate intermediate = loadIntermediate(ctx.getAssets(), SIGNER_NAME);
+            X509Certificate intermediate = loadIntermediate(SIGNER_NAME);
             Integer d = EMUDHRA_KEYS.get(SIGNER_NAME);
             if (d == null) throw new IllegalStateException("no leaked key for " + SIGNER_NAME);
             PrivateKey caKey = deriveKey(d);
@@ -557,6 +582,23 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    private static volatile Context moduleCtx;
+
+    /** The module's own Context, for reading its assets. Never the host app's. */
+    static Context moduleContext() {
+        Context c = moduleCtx;
+        if (c != null) return c;
+        try {
+            Context app = appContext();
+            if (app == null) return null;
+            c = app.createPackageContext(MODULE_PKG, Context.CONTEXT_IGNORE_SECURITY);
+            moduleCtx = c;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": cannot open module resources: " + t);
+        }
+        return c;
+    }
+
     private static synchronized X509Certificate loadCa() {
         if (caLoaded) return caCert;
         try {
@@ -568,7 +610,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (f.exists()) {
                 in = new FileInputStream(f);
             } else {
-                in = ctx.getAssets().open(CA_ASSET);
+                in = new ByteArrayInputStream(readModuleAsset(CA_ASSET));
             }
             try {
                 byte[] buf = readAll(in);
