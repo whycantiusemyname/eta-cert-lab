@@ -92,8 +92,27 @@ public class MainHook implements IXposedHookLoadPackage {
         put("EM-OV-TLS-CA-G3C", 4);
     }};
 
-    /** Registers nothing globally; passed explicitly to every JCA helper. */
-    static final BouncyCastleProvider BC = new BouncyCastleProvider();
+    /**
+     * Lazily created BouncyCastle instance. It is deliberately not a static final field:
+     * constructing it registers hundreds of algorithms and would block whichever thread
+     * first touches this class -- usually the app's main thread during startup.
+     */
+    private static volatile BouncyCastleProvider bc;
+
+    static BouncyCastleProvider bc() {
+        BouncyCastleProvider b = bc;
+        if (b == null) {
+            synchronized (MainHook.class) {
+                b = bc;
+                if (b == null) {
+                    b = new BouncyCastleProvider();
+                    bc = b;
+                }
+            }
+        }
+        return b;
+    }
+
     private static final java.security.SecureRandom RNG = new java.security.SecureRandom();
 
     private static boolean injectCa = true;
@@ -150,16 +169,23 @@ public class MainHook implements IXposedHookLoadPackage {
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                signLeafOnce();
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + ": sign in bind failed: " + t);
-                            }
-                            try {
-                                startMitm(lpparam);
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + ": mitm in bind failed: " + t);
-                            }
+                            // Everything here loads BouncyCastle and generates keys, which is
+                            // far too slow for the main thread: run it on a worker and let the
+                            // already-installed hooks pick up the server once it binds.
+                            Thread t = new Thread(() -> {
+                                try {
+                                    signLeafOnce();
+                                } catch (Throwable e) {
+                                    XposedBridge.log(TAG + ": sign in bind failed: " + e);
+                                }
+                                try {
+                                    startMitm(lpparam);
+                                } catch (Throwable e) {
+                                    XposedBridge.log(TAG + ": mitm in bind failed: " + e);
+                                }
+                            }, "eta-certlab-init");
+                            t.setDaemon(true);
+                            t.start();
                         }
                     });
         } catch (Throwable t) {
@@ -319,8 +345,8 @@ public class MainHook implements IXposedHookLoadPackage {
         builder.addExtension(Extension.extendedKeyUsage, false,
                 new ExtendedKeyUsage(KeyPurposeId.id_kp_serverAuth));
         X509CertificateHolder holder = builder.build(
-                new JcaContentSignerBuilder("SHA384withECDSA").setProvider(BC).build(signer));
-        return new JcaX509CertificateConverter().setProvider(BC).getCertificate(holder);
+                new JcaContentSignerBuilder("SHA384withECDSA").setProvider(bc()).build(signer));
+        return new JcaX509CertificateConverter().setProvider(bc()).getCertificate(holder);
     }
 
     static byte[] toPem(Object o) throws Exception {
