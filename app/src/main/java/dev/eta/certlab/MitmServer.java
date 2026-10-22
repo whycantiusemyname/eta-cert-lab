@@ -637,6 +637,7 @@ final class MitmServer {
                 if (a != null) IP2HOST.put(a.getHostAddress(), host);
             }
         }
+        noteHost(host);
     }
 
     static String hostForInet(java.net.InetAddress a) {

@@ -115,7 +115,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final java.security.SecureRandom RNG = new java.security.SecureRandom();
 
-    private static boolean injectCa = true;
+    private static boolean injectCa = false;
     private static boolean bypassBlocklist = true;
     /** write a demo leaf for the configured host into the app's private dir */
     private static boolean signLeaf = true;
@@ -141,7 +141,6 @@ public class MainHook implements IXposedHookLoadPackage {
             // Install the network hooks immediately: they stay inert until the MITM server
             // is up, and installing them this early means Application.onCreate()
             // connections are covered as soon as it binds.
-            hookHostCapture();
             hookInetLookup();
             hookSocketRedirect();
             // Context is almost never ready this early, so the bind hook is what really
@@ -157,41 +156,66 @@ public class MainHook implements IXposedHookLoadPackage {
     // ------------------------------------------------------------------ bind
 
     /**
-     * Runs after ActivityThread.handleBindApplication, i.e. when currentApplication()
-     * is finally non-null. Everything that needs a Context happens here.
+     * LSPosed hands us handleLoadPackage from inside ActivityThread.handleBindApplication,
+     * so hooking that method here is too late: the hook point at its entry has already
+     * been passed and the after-callback never fires. Hook something that is still ahead
+     * of us instead -- Instrumentation.callApplicationOnCreate runs after the Application
+     * object exists, and performLaunchActivity is a second chance when an app has no
+     * Application subclass at all.
      */
     private static void hookBind(XC_LoadPackage.LoadPackageParam lpparam) {
         if (bindHooked) return;
         bindHooked = true;
         try {
-            XposedHelpers.findAndHookMethod("android.app.ActivityThread",
-                    lpparam.classLoader, "handleBindApplication",
-                    "android.app.ActivityThread$AppBindData",
+            XposedHelpers.findAndHookMethod("android.app.Instrumentation",
+                    lpparam.classLoader, "callApplicationOnCreate",
+                    android.app.Application.class,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            // Everything here loads BouncyCastle and generates keys, which is
-                            // far too slow for the main thread: run it on a worker and let the
-                            // already-installed hooks pick up the server once it binds.
-                            Thread t = new Thread(() -> {
-                                try {
-                                    signLeafOnce();
-                                } catch (Throwable e) {
-                                    XposedBridge.log(TAG + ": sign in bind failed: " + e);
-                                }
-                                try {
-                                    startMitm(lpparam);
-                                } catch (Throwable e) {
-                                    XposedBridge.log(TAG + ": mitm in bind failed: " + e);
-                                }
-                            }, "eta-certlab-init");
-                            t.setDaemon(true);
-                            t.start();
+                            boot(lpparam);
                         }
                     });
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": bind hook failed: " + t);
+            XposedBridge.log(TAG + ": callApplicationOnCreate hook failed: " + t);
         }
+        try {
+            XposedHelpers.findAndHookMethod("android.app.ActivityThread",
+                    lpparam.classLoader, "performLaunchActivity",
+                    "android.app.ActivityThread$ActivityClientRecord",
+                    android.content.Intent.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            boot(lpparam);
+                        }
+                    });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": performLaunchActivity hook failed: " + t);
+        }
+    }
+
+    private static boolean booted;
+
+    /** Context is available now; everything slow runs off the main thread. */
+    private static void boot(XC_LoadPackage.LoadPackageParam lpparam) {
+        if (booted) return;
+        booted = true;
+        XposedBridge.log(TAG + ": booting (context ready)");
+        Thread t = new Thread(() -> {
+            try {
+                signLeafOnce();
+            } catch (Throwable e) {
+                XposedBridge.log(TAG + ": signing failed: " + e);
+            }
+            try {
+                startMitm(lpparam);
+            } catch (Throwable e) {
+                XposedBridge.log(TAG + ": mitm start threw: " + e);
+            }
+        }, "eta-certlab-init");
+        t.setDaemon(true);
+        t.start();
     }
 
     // ------------------------------------------------------------------ mitm
@@ -205,9 +229,11 @@ public class MainHook implements IXposedHookLoadPackage {
             Context ctx = appContext();
             if (ctx == null) {
                 XposedBridge.log(TAG + ": no context, mitm not started");
+                mitmStarted = false;
                 return;
             }
             MitmServer.start(ctx, s -> XposedBridge.log(TAG + ": " + s));
+            XposedBridge.log(TAG + ": mitm port " + MitmServer.port());
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": mitm start failed: " + t);
         }
@@ -248,39 +274,6 @@ public class MainHook implements IXposedHookLoadPackage {
      * Socket.connect() only sees the resolved address (often a Clash fake-IP), so the
      * SNI fallback needs a better source: the hostname handed to SSLSocketFactory.
      */
-    private static boolean hostCaptureHooked;
-
-    private static void hookHostCapture() {        if (hostCaptureHooked) return;
-        hostCaptureHooked = true;
-        try {
-            // hookAllMethods would trip over the abstract createSocket() overload and
-            // could leave the interesting one unhooked, so target it explicitly.
-            XposedHelpers.findAndHookMethod(SSLSocketFactory.class, "createSocket",
-                    java.net.Socket.class, String.class, int.class, boolean.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            Object a = param.args[1];
-                            if (a instanceof String && MitmServer.shouldInterceptHost((String) a)) {
-                                MitmServer.noteHost((String) a);
-                            }
-                        }
-                    });
-            XposedHelpers.findAndHookMethod(SSLSocketFactory.class, "createSocket",
-                    String.class, int.class, new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            Object a = param.args[0];
-                            if (a instanceof String && MitmServer.shouldInterceptHost((String) a)) {
-                                MitmServer.noteHost((String) a);
-                            }
-                        }
-                    });
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": host capture failed: " + t);
-        }
-    }
-
     /**
      * OkHttp resolves names through InetAddress.getAllByName, which is the last place
      * that still knows the real hostname once Clash has handed back a fake-IP.
