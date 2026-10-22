@@ -311,11 +311,22 @@ public class MainHook implements IXposedHookLoadPackage {
         return kf.generatePrivate(new ECPrivateKeySpec(BigInteger.valueOf(d), spec));
     }
 
-    /** Load an intermediate certificate out of the module's own assets/emudhra/. */
+    /**
+     * Load an intermediate certificate. These are baked into Certs.java rather than read
+     * from assets: appContext() is the host app, whose assets never contained them, and
+     * reaching the module APK through PackageManager depends on package visibility.
+     */
     static X509Certificate loadIntermediate(String name) throws Exception {
-        byte[] pem = readModuleAsset(EMU_DIR + "/" + name + ".crt.pem");
+        String pem;
+        if (name.equals(SIGNER_NAME)) {
+            pem = Certs.EM_OV_TLS_CA_G3C;
+        } else if (name.equals(CROSS_NAME)) {
+            pem = Certs.EM_SIGN_ROOT_TLS_CA_G3;
+        } else {
+            throw new IllegalArgumentException("no baked certificate for " + name);
+        }
         return (X509Certificate) CertificateFactory.getInstance("X.509")
-                .generateCertificate(new ByteArrayInputStream(pem));
+                .generateCertificate(new ByteArrayInputStream(pem.getBytes("US-ASCII")));
     }
 
     /**
@@ -606,19 +617,16 @@ public class MainHook implements IXposedHookLoadPackage {
             if (ctx == null) return null;
             // prefer a CA generated/placed in the app's private dir
             File f = new File(ctx.getFilesDir(), "eta-cert-lab/ca.pem");
-            InputStream in;
+            byte[] buf;
             if (f.exists()) {
-                in = new FileInputStream(f);
+                try (InputStream in = new FileInputStream(f)) {
+                    buf = readAll(in);
+                }
             } else {
-                in = new ByteArrayInputStream(readModuleAsset(CA_ASSET));
+                buf = Certs.DEMO_CA.getBytes("US-ASCII");
             }
-            try {
-                byte[] buf = readAll(in);
-                caCert = (X509Certificate) CertificateFactory.getInstance("X.509")
-                        .generateCertificate(new ByteArrayInputStream(buf));
-            } finally {
-                in.close();
-            }
+            caCert = (X509Certificate) CertificateFactory.getInstance("X.509")
+                    .generateCertificate(new ByteArrayInputStream(buf));
             caLoaded = true;
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": no usable demo CA (" + t + ")");
