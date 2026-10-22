@@ -114,7 +114,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final java.security.SecureRandom RNG = new java.security.SecureRandom();
 
-    private static boolean injectCa = false;
+    private static boolean injectCa = true;
     private static boolean bypassBlocklist = true;
     /** write a demo leaf for the configured host into the app's private dir */
     private static boolean signLeaf = true;
@@ -202,20 +202,7 @@ public class MainHook implements IXposedHookLoadPackage {
         if (booted) return;
         booted = true;
         XposedBridge.log(TAG + ": booting (context ready)");
-        Thread t = new Thread(() -> {
-            try {
-                signLeafOnce();
-            } catch (Throwable e) {
-                XposedBridge.log(TAG + ": signing failed: " + e);
-            }
-            try {
-                startMitm(lpparam);
-            } catch (Throwable e) {
-                XposedBridge.log(TAG + ": mitm start threw: " + e);
-            }
-        }, "eta-certlab-init");
-        t.setDaemon(true);
-        t.start();
+        XposedBridge.log(TAG + ": CA injection armed, in-process MITM disabled (use mitmproxy)");
     }
 
     // ------------------------------------------------------------------ mitm
@@ -623,7 +610,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     buf = readAll(in);
                 }
             } else {
-                buf = Certs.DEMO_CA.getBytes("US-ASCII");
+                buf = Certs.MITM_CA.getBytes("US-ASCII");
             }
             caCert = (X509Certificate) CertificateFactory.getInstance("X.509")
                     .generateCertificate(new ByteArrayInputStream(buf));
